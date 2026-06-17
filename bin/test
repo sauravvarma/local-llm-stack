@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Run the modelctl test suite (stdlib unittest, no dependencies).
+# Pass extra args through, e.g. `bin/test -v` or `bin/test -k resolve`.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec env PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m unittest discover -s "$DIR/tests" -t "$DIR" "$@"

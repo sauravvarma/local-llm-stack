@@ -1,0 +1,7 @@
+# Model weights live here but are never committed — they're large binaries
+# managed by `modelctl`, not source.
+/models/
+
+# Python
+__pycache__/
+*.pyc
