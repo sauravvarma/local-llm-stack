@@ -5,3 +5,10 @@
 # Python
 __pycache__/
 *.pyc
+
+# Scaffold cruft, not part of modelctl
+.DS_Store
+.python-version
+/local-llm-stack/
+/main.py
+/pyproject.toml
