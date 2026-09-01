@@ -56,6 +56,47 @@ bin/modelctl sync --import-ollama
 bin/modelctl ollama-import <repo> [file] --name name:tag
 ```
 
+## Serving — `llm-serve`
+
+`modelctl` puts models where tools expect them; `llm-serve` actually runs one
+on an OpenAI-compatible endpoint, on either llama.cpp or LM Studio.
+
+```sh
+bin/llm-serve list                    # store contents + what each model can do
+bin/llm-serve                         # default model, best available mode
+bin/llm-serve <model> [mode]          # llama.cpp   (port 8080)
+bin/llm-serve lms <model> [mode]      # LM Studio   (port 1234)
+bin/llm-serve hermes                  # point Hermes Agent at whatever is running
+bin/llm-serve status | stop
+```
+
+Model names are the short aliases from `llm-serve list`; a unique prefix works.
+Modes are `auto` (default), `fast`, `mtp`, `vision`, `plain`, and `auto` picks
+the fastest the model and machine actually support — a DFlash2 drafter if one
+is in the store and a build that supports it is installed, else a built-in MTP
+head, else plain. MLX models are LM Studio only; asking llama.cpp for one
+fails with the `lms` command to use instead.
+
+Every mode serves with `--jinja` (tool-calling from the model's own chat
+template) and `--reasoning-format deepseek` (thinking kept out of
+`message.content`), which is what agent frameworks expect.
+
+### `llm-probe`
+
+`llm-serve` has no hardcoded model list. `bin/llm-probe` walks the store and
+reads each GGUF's real header — metadata for architecture and context length,
+then the tensor table for `nextn.*` names that mean a built-in MTP head.
+Vision comes from a sibling `mmproj-*.gguf`, a DFlash drafter from a matching
+`*-DFlash2-GGUF` repo. Output is JSON, cached and invalidated on store mtime.
+
+```sh
+bin/llm-probe             # the registry
+bin/llm-probe --refresh   # re-parse, ignoring the cache
+```
+
+Download a model with `modelctl download` and it shows up in `llm-serve list`
+with correct capabilities, no edits needed.
+
 ## Configuration (env vars, all optional)
 
 | Var | Default | Meaning |
@@ -65,6 +106,10 @@ bin/modelctl ollama-import <repo> [file] --name name:tag
 | `HF_HOME` / `HF_HUB_CACHE` | `~/.cache/huggingface` | HF cache location |
 | `MODELCTL_LMSTUDIO_DIR` | `~/.lmstudio/models` | LM Studio's models root |
 | `MODELCTL_GGUF_DIR` | `~/models/gguf` | flat GGUF library for llama.cpp |
+| `LLM_MODEL` | `qwen3.8-27b` | `llm-serve` default model |
+| `LLM_PORT` / `LMS_PORT` | `8080` / `1234` | llama.cpp and LM Studio ports |
+| `LLM_CTX` | `65536` | context length (Hermes Agent requires ≥64K) |
+| `LLM_RUN_DIR` | `$XDG_STATE_HOME/llm-serve` | pid, log, state, registry cache |
 
 > The `models/` folder is gitignored (large binaries, never committed) and so
 > lives only in your primary checkout — Conductor worktrees won't have it. Point
