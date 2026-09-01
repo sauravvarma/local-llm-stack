@@ -151,12 +151,28 @@ cmd_llamacpp(){
   mode="$(pick_mode "$a" "${2:-auto}")"
   local model; model="$(field "$a" path)"
   [[ -f "$model" ]] || die "missing weights: $model"
-  up_llamacpp && { echo "already up ($(sline 2) [$(sline 3)]); 'llm-serve stop' first"; exit 0; }
+  if up_llamacpp; then
+    # State can be missing (server started by hand, or state dir moved), so
+    # ask the server what it is actually serving rather than printing blanks.
+    local now; now="$(sline 2)"
+    [[ -n "$now" ]] || now="$(curl -s --max-time 2 "http://127.0.0.1:$PORT/v1/models" 2>/dev/null \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null)"
+    local m; m="$(sline 3)"
+    if [[ "$now" == "$a" ]]; then
+      echo "already serving $a${m:+ [$m]} on port $PORT"
+    else
+      echo "port $PORT is serving ${now:-an unknown model}${m:+ [$m]}, not $a"
+      echo "run 'llm-serve stop' first, or set LLM_PORT to use another port"
+    fi
+    exit 0
+  fi
 
   local bin="${BIN_STOCK:-$BIN_DFLASH}"
   # --jinja gives tool-calling from the model's own template; deepseek
   # reasoning-format keeps <think> out of message.content for agents.
-  local -a cmd=( -m "$model" -c "$CTX" -ngl 999 -fa 1 -b 1024
+  # -b/-ub at llama.cpp's defaults: measured fastest here. A smaller -b costs
+  # ~20% prefill, a larger one is no better.
+  local -a cmd=( -m "$model" -c "$CTX" -ngl 999 -fa 1 -b 2048 -ub 512
                  --host 127.0.0.1 --port "$PORT" --jinja
                  --reasoning-format deepseek --alias "$a" )
   case "$mode" in
