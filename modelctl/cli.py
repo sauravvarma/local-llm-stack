@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 from . import __version__
 from .adapters import build_adapters
 from .adapters.ollama import OllamaAdapter
-from .cache import find_repo, hf_cache_repo_ids, human_size
+from .cache import ModelFile, Repo, find_repo, hf_cache_repo_ids, human_size
 from .config import Config
 
 
@@ -152,6 +154,140 @@ def cmd_adopt(cfg: Config, args) -> int:
     return 0
 
 
+# ------------------------------------------------------------------------ rm
+
+def _check_removable(store: Path, path: Path, *, confine: Path | None = None) -> str | None:
+    """Paranoid guard run before anything is deleted. `path` must be absolute,
+    must not be the filesystem root or the store root, must sit lexically inside
+    the primary store (so `..` or an absolute arg can't escape), and, unless it
+    is itself a symlink (which is only unlinked, never followed), must still be
+    inside the store after resolving. `confine` additionally pins individual
+    files inside their own model dir. Returns an error message, or None if OK."""
+    p = Path(os.path.normpath(str(path)))
+    store = Path(os.path.normpath(str(store.expanduser())))
+    if not p.is_absolute() or str(p) in ("", p.anchor):
+        return f"refusing to remove unsafe path: {path}"
+    if p == store or store not in p.parents:
+        return f"refusing: {p} is not inside the primary store {store}"
+    if confine is not None:
+        confine = Path(os.path.normpath(str(confine)))
+        if p == confine or confine not in p.parents:
+            return f"refusing: {p} is not inside {confine}"
+    if not p.is_symlink():
+        try:
+            real, store_real = p.resolve(), store.resolve()
+        except OSError:
+            return f"refusing: cannot resolve {p}"
+        if real == store_real or store_real not in real.parents:
+            return f"refusing: {p} resolves outside the store ({real})"
+    return None
+
+
+def _prune_empty_dirs(start: Path, stop: Path) -> None:
+    """Drop directories left empty under `stop` (exclusive) after a removal."""
+    p = start
+    while p != stop and stop in p.parents and p.is_dir() and not p.is_symlink():
+        try:
+            p.rmdir()
+        except OSError:
+            return
+        p = p.parent
+
+
+def _pick_files(repo: Repo, names: list[str]) -> tuple[list[ModelFile], list[str]]:
+    """Resolve file arguments (basename or store-relative path) to ModelFiles."""
+    chosen: dict[str, ModelFile] = {}
+    missing: list[str] = []
+    for n in names:
+        hits = [f for f in repo.files if f.basename == n or f.filename == n]
+        if not hits:
+            missing.append(n)
+        for f in hits:
+            chosen[f.filename] = f
+    return [f for f in repo.files if f.filename in chosen], missing
+
+
+def _confirm(question: str) -> bool:
+    try:
+        return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def cmd_rm(cfg: Config, args) -> int:
+    """Delete a model (or specific files) from the primary store, taking the
+    projections down with it. Read-only sources (HF cache, extra stores) are
+    refused rather than touched."""
+    repo = find_repo(cfg.scan(), args.repo)
+    if not repo:
+        print(f"not found: {args.repo}  (try: modelctl list)", file=sys.stderr)
+        return 1
+    if repo.store == "hf-cache":
+        print(f"{repo.repo_id} lives only in the HF hub cache ({cfg.hub}), which modelctl "
+              f"scans read-only and never deletes from.\n"
+              f"Remove it with `hf cache delete` (or delete the models--* dir under "
+              f"{cfg.hub} yourself).", file=sys.stderr)
+        return 1
+    if repo.store != "store":
+        print(f"{repo.repo_id} lives in a secondary store ({repo.root}), which is scanned "
+              f"read-only; `modelctl rm` only removes from the primary store {cfg.store}.",
+              file=sys.stderr)
+        return 1
+
+    files = repo.files
+    if args.files:
+        files, missing = _pick_files(repo, args.files)
+        if missing:
+            print(f"file(s) not in {repo.repo_id}: {', '.join(missing)}", file=sys.stderr)
+            return 1
+    whole = len(files) == len(repo.files)
+
+    targets = [repo.root] if whole else [repo.root / f.filename for f in files]
+    for t in targets:
+        err = _check_removable(cfg.store, t, confine=None if whole else repo.root)
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+
+    # A symlinked model dir (`modelctl adopt --link`) only costs the link itself.
+    linked = whole and repo.root.is_symlink()
+    reclaim = 0 if linked else sum(f.size for f in files)
+
+    prefix = "DRY RUN — " if args.dry_run else ""
+    scope = "all files" if whole else f"{len(files)} file{'' if len(files) == 1 else 's'}"
+    print(f"{prefix}remove {repo.repo_id}  [{repo.fmt}]  {scope}  {human_size(reclaim)}")
+    for t in targets:
+        print(f"  x {t}{'  (symlink only; bytes stay at the target)' if linked else ''}")
+
+    # Undo every tool's projection first, so nothing is left pointing at bytes
+    # that are about to disappear. Planned (dry) here; executed after confirming.
+    adapters = build_adapters(cfg)
+    plan = [a for ad in adapters.values() for a in ad.remove(repo, files, dry_run=True)]
+    for a in plan:
+        print(a)
+
+    if args.dry_run:
+        return 0
+    if not args.yes and not _confirm(f"Delete {repo.repo_id} from {cfg.store}?"):
+        print("aborted.")
+        return 1
+
+    for ad in adapters.values():
+        for a in ad.remove(repo, files, dry_run=False):
+            if a.op == "error":
+                print(a)
+
+    for t in targets:
+        if t.is_symlink() or t.is_file():
+            t.unlink()
+        else:
+            shutil.rmtree(t)
+        _prune_empty_dirs(t.parent, cfg.store)
+
+    print(f"removed {repo.repo_id}; {human_size(reclaim)} reclaimed")
+    return 0
+
+
 def cmd_doctor(cfg: Config, args) -> int:
     print("Stores (scanned in order, first match wins):")
     print(f"  - {cfg.store}  (primary / download target){'' if cfg.store.is_dir() else '  [missing]'}")
@@ -215,6 +351,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--link", action="store_true", help="symlink instead of moving (non-destructive)")
     sp.add_argument("-n", "--dry-run", action="store_true")
     sp.set_defaults(func=cmd_adopt)
+
+    sp = sub.add_parser("rm", aliases=["remove"], help="delete a model from the primary store")
+    sp.add_argument("repo")
+    sp.add_argument("files", nargs="*", help="specific files (else the whole model dir)")
+    sp.add_argument("-n", "--dry-run", action="store_true", help="print what would go; delete nothing")
+    sp.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    sp.set_defaults(func=cmd_rm)
 
     sp = sub.add_parser("doctor", help="show stores + per-tool checks")
     sp.set_defaults(func=cmd_doctor)
