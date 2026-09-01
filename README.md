@@ -24,7 +24,7 @@ Each model is classified from its files/`config.json`; adapters accept by capabi
 
 | format | how detected | vLLM | mlx_lm | LM Studio | llama.cpp | ollama |
 |--------|--------------|:----:|:------:|:---------:|:---------:|:------:|
-| **gguf** | `*.gguf` | – | – | ✓ symlink | ✓ symlink | ✓ *copy* |
+| **gguf** | `*.gguf` | – | – | ✓ symlink | ✓ path | ✓ *copy* |
 | **mlx** | top-level `quantization` in config / name `*MLX*` | – | ✓ path | ✓ dir symlink | – | – |
 | **safetensors** | `*.safetensors` + `config.json` (full / GPTQ / AWQ) | ✓ path | ✓ path | – | – | – |
 
@@ -35,8 +35,8 @@ How each tool is served:
   launch command (`vllm serve <path>`, `mlx_lm.generate --model <path>`).
 - **LM Studio** — symlinked into `~/.lmstudio/models/<pub>/<model>` (a directory
   for MLX, per-file for GGUF). LM Studio follows the symlinks.
-- **llama.cpp** — `modelctl resolve <repo>` → path for `-m`, plus a flat symlink
-  library at `~/models/gguf/`.
+- **llama.cpp** — `modelctl resolve <repo>` → path for `-m`. Nothing to project:
+  the store's `<pub>/<model>/file.gguf` tree is already a fine library.
 - **Ollama** — the outlier: its content-addressed blob store can't symlink, so
   reuse means *importing* (copying) via a Modelfile. Opt-in only.
 
@@ -48,6 +48,7 @@ bin/modelctl sync                         # project the store into every tool
 bin/modelctl sync -n                      # dry run
 bin/modelctl resolve <repo> [file]        # path to load (dir for mlx/safetensors, file for gguf)
 bin/modelctl download <repo> [file …]     # hf download into models/<pub>/<model>, then sync
+bin/modelctl rm <repo> [file …]           # delete from the store (-n dry run, -y no prompt)
 bin/modelctl doctor                       # stores + per-tool checks
 bin/modelctl env                          # shell exports
 
@@ -64,7 +65,6 @@ bin/modelctl ollama-import <repo> [file] --name name:tag
 | `MODELCTL_SCAN_HUB` | `1` | also scan the HF cache (`0` to disable) |
 | `HF_HOME` / `HF_HUB_CACHE` | `~/.cache/huggingface` | HF cache location |
 | `MODELCTL_LMSTUDIO_DIR` | `~/.lmstudio/models` | LM Studio's models root |
-| `MODELCTL_GGUF_DIR` | `~/models/gguf` | flat GGUF library for llama.cpp |
 
 > The `models/` folder is gitignored (large binaries, never committed) and so
 > lives only in your primary checkout — Conductor worktrees won't have it. Point
@@ -82,11 +82,13 @@ Stdlib `unittest`, zero dependencies. Synthetic stores/caches are built in temp
 dirs (`tests/helpers.py`) — the suite never touches the real HF cache, LM Studio
 dir, or any model bytes, and external tools (`hf`, `ollama`) are mocked. Covers
 the registry/classification, config + store de-dup, `ensure_symlink` semantics,
-every adapter's accept/sync behavior, and every CLI command.
+every adapter's accept/sync/remove behavior, the `rm` path guard, and every CLI
+command.
 
 ## Adding a tool
 
-Implement `accepts` / `sync` / `doctor` in `modelctl/adapters/`, register it in
+Implement `accepts` / `sync` / `doctor` (and `remove`, if it projects anything)
+in `modelctl/adapters/`, register it in
 `adapters/__init__.py`. Every adapter receives the same classified `Repo` view
 from `modelctl/cache.py`, so a new adapter is ~30 lines.
 
@@ -103,6 +105,13 @@ the adapters as the projection layer a GUI would drive.
   it never fights a `huggingface_hub` version and runs anywhere.
 - `modelctl` only ever creates/replaces symlinks it would make itself; a real
   file/dir at a target path is reported as an error and left untouched.
-- Interrupted downloads (`*.part`) and hidden files are ignored by the scanner.
+- `rm` deletes only from the **primary store**, after validating the target
+  really is inside it (no `..`, no absolute or symlink escape, never the store
+  root). Secondary stores and the HF cache are scanned read-only and refused
+  (`hf cache delete` handles the latter). Projections into other tools are torn
+  down first, so nothing is left dangling; an ollama import copied the bytes
+  elsewhere, so `rm` prints the `ollama rm` you'd also need rather than running it.
+- Interrupted downloads (`*.part`), hidden files and hidden directories (e.g.
+  `hf`'s `.cache/huggingface/download/` bookkeeping) are ignored by the scanner.
 - vLLM needs CUDA; on macOS it's CPU-only/experimental — typically run on a
   Linux+GPU box mounting the same store.

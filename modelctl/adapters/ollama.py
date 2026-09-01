@@ -66,6 +66,37 @@ class OllamaAdapter(Adapter):
         finally:
             Path(modelfile).unlink(missing_ok=True)
 
+    def imported_names(self) -> set[str]:
+        """Names ollama already has, read-only (`ollama list`). Empty when
+        ollama isn't installed or the query fails."""
+        if shutil.which("ollama") is None:
+            return set()
+        try:
+            out = subprocess.run(["ollama", "list"], check=True,
+                                 capture_output=True, text=True).stdout
+        except (OSError, subprocess.CalledProcessError):
+            return set()
+        return {line.split()[0] for line in out.splitlines()[1:] if line.split()}
+
+    def remove(self, repo: Repo, files: list, *, dry_run: bool = False) -> list[Action]:
+        """Nothing to unlink: an import COPIED the bytes into ollama's blob
+        store, so deleting from the store reclaims nothing there. Report the
+        `ollama rm` the user would need; never run it for them."""
+        if not self.accepts(repo):
+            return []
+        have = self.imported_names()
+        actions: list[Action] = []
+        for f in files:
+            if not f.is_gguf:
+                continue
+            name = _tag(repo.model, f.basename)
+            if name in have:
+                actions.append(Action(
+                    self.name, "warn", name,
+                    f"imported copy is NOT reclaimed by this removal; run `ollama rm {name}`",
+                ))
+        return actions
+
     def doctor(self) -> list[str]:
         found = "found" if shutil.which("ollama") else "not on PATH"
         return [

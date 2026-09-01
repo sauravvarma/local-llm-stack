@@ -5,6 +5,7 @@ The contract is deliberately tiny:
 
     accepts(repo)            -> is this repo relevant to my tool?
     sync(repos, dry_run)     -> make my tool's view match the cache (idempotent)
+    remove(repo, files)      -> undo my projection of a repo about to be deleted
     doctor()                 -> human-readable config/env checks
 """
 
@@ -20,14 +21,14 @@ from ..cache import Repo
 @dataclass
 class Action:
     adapter: str
-    op: str        # "link" | "copy" | "native" | "skip" | "relink" | "error"
+    op: str        # "link" | "copy" | "native" | "skip" | "relink" | "unlink" | "warn" | "error"
     target: str
     detail: str = ""
 
     def __str__(self) -> str:
         glyph = {
             "link": "+", "relink": "~", "copy": "C", "native": "=",
-            "skip": ".", "error": "!",
+            "skip": ".", "unlink": "-", "warn": "*", "error": "!",
         }.get(self.op, "?")
         line = f"  {glyph} [{self.adapter}] {self.target}"
         return f"{line}  ({self.detail})" if self.detail else line
@@ -40,6 +41,12 @@ class Adapter:
         return False
 
     def sync(self, repos: list[Repo], *, dry_run: bool = False) -> list[Action]:
+        return []
+
+    def remove(self, repo: Repo, files: list, *, dry_run: bool = False) -> list[Action]:
+        """Undo this tool's projection of `files` (a subset of `repo.files`, or
+        all of them) before they're deleted from the store. Adapters that never
+        project anything (path-native tools) have nothing to do."""
         return []
 
     def doctor(self) -> list[str]:
@@ -75,3 +82,32 @@ def ensure_symlink(target: Path, source: Path, adapter: str, *, dry_run: bool) -
         target.parent.mkdir(parents=True, exist_ok=True)
         target.symlink_to(source)
     return Action(adapter, "link", rel_target, f"-> {source}")
+
+
+def remove_symlink(target: Path, adapter: str, *, dry_run: bool) -> Action | None:
+    """Drop a projection symlink modelctl itself would have created. Only
+    symlinks are ever removed: a real file/dir at the target isn't ours (the
+    store may *be* the projection root), so it's left alone."""
+    if not target.is_symlink():
+        return None
+    if not dry_run:
+        target.unlink()
+    return Action(adapter, "unlink", str(target), "projection removed")
+
+
+def prune_empty(path: Path, stop: Path, adapter: str) -> list[Action]:
+    """Remove directories left empty under `stop` once a projection went away.
+    Real work only: in a dry run nothing was unlinked, so there's nothing to
+    predict beyond the unlink lines already reported."""
+    actions: list[Action] = []
+    p = path
+    while p != stop and stop in p.parents:
+        if p.is_symlink() or not p.is_dir():
+            break
+        try:
+            p.rmdir()
+        except OSError:
+            break
+        actions.append(Action(adapter, "unlink", str(p), "empty dir"))
+        p = p.parent
+    return actions

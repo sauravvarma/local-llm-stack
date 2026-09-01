@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..cache import Repo
-from .base import Action, Adapter, ensure_symlink
+from .base import Action, Adapter, ensure_symlink, prune_empty, remove_symlink
 
 
 class LMStudioAdapter(Adapter):
@@ -36,6 +36,35 @@ class LMStudioAdapter(Adapter):
             else:  # mlx: link the whole model directory
                 target = self.models_dir / repo.publisher / repo.model
                 actions.append(ensure_symlink(target, repo.root, self.name, dry_run=dry_run))
+        return actions
+
+    def remove(self, repo: Repo, files: list, *, dry_run: bool = False) -> list[Action]:
+        """Tear down the symlinks `sync` put here, so deleting the store model
+        doesn't leave LM Studio indexing dangling links."""
+        if not self.accepts(repo):
+            return []
+        base = self.models_dir / repo.publisher / repo.model
+        whole = len(files) == len(repo.files)
+        actions: list[Action] = []
+        parents: list[Path] = []
+        if repo.fmt == "gguf":
+            for f in files:
+                if not f.is_gguf:
+                    continue
+                target = base / f.filename
+                a = remove_symlink(target, self.name, dry_run=dry_run)
+                if a:
+                    actions.append(a)
+                    parents.append(target.parent)
+        elif whole:  # mlx: one directory symlink
+            a = remove_symlink(base, self.name, dry_run=dry_run)
+            if a:
+                actions.append(a)
+                parents.append(base.parent)
+        if not dry_run:
+            # deepest first, so a quant subfolder goes before its model dir
+            for d in sorted(set(parents), key=lambda p: len(p.parts), reverse=True):
+                actions += prune_empty(d, self.models_dir, self.name)
         return actions
 
     def doctor(self) -> list[str]:

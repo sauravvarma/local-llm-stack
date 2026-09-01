@@ -184,6 +184,210 @@ class CliTest(EnvTestCase):
         self.assertEqual(code, 0)
         self.assertIn("already", out)
 
+    # --- rm ---------------------------------------------------------------
+
+    def test_rm_deletes_model_dir_and_reports_size(self):
+        run("sync", "-a", "lmstudio")
+        target = self.store / "unsloth" / "tiny-GGUF"
+        self.assertTrue(target.is_dir())
+        code, out, _ = run("rm", "unsloth/tiny-GGUF", "-y")
+        self.assertEqual(code, 0)
+        self.assertFalse(target.exists())
+        self.assertIn("reclaimed", out)
+        self.assertIn("32B", out)  # tiny-Q4_K_M.gguf is 32 bytes
+        # empty publisher dir pruned, the rest of the store untouched
+        self.assertFalse((self.store / "unsloth").exists())
+        self.assertTrue((self.store / "Qwen" / "Qwen3-7B").is_dir())
+
+    def test_rm_takes_down_lmstudio_projection(self):
+        run("sync", "-a", "lmstudio")
+        link = self.lm / "lmstudio-community" / "gemma-GGUF" / "gemma-Q8_0.gguf"
+        self.assertTrue(link.is_symlink())
+        code, out, _ = run("rm", "lmstudio-community/gemma-GGUF", "-y")
+        self.assertEqual(code, 0)
+        self.assertIn("[lmstudio]", out)
+        self.assertFalse(link.is_symlink())
+        self.assertFalse((self.lm / "lmstudio-community").exists())  # pruned
+
+    def test_rm_mlx_dir_symlink_projection(self):
+        run("sync", "-a", "lmstudio")
+        link = self.lm / "mlx-community" / "gemma-8bit"
+        self.assertTrue(link.is_symlink())
+        code, _, _ = run("rm", "mlx-community/gemma-8bit", "-y")
+        self.assertEqual(code, 0)
+        self.assertFalse(link.is_symlink())
+        self.assertFalse((self.store / "mlx-community" / "gemma-8bit").exists())
+
+    def test_rm_specific_file_keeps_the_rest(self):
+        run("sync", "-a", "lmstudio")
+        code, out, _ = run("rm", "lmstudio-community/gemma-GGUF", "mmproj-BF16.gguf", "-y")
+        self.assertEqual(code, 0)
+        self.assertIn("1 file", out)
+        gone = self.store / "lmstudio-community" / "gemma-GGUF" / "mmproj-BF16.gguf"
+        kept = self.store / "lmstudio-community" / "gemma-GGUF" / "gemma-Q8_0.gguf"
+        self.assertFalse(gone.exists())
+        self.assertTrue(kept.is_file())
+        self.assertFalse((self.lm / "lmstudio-community" / "gemma-GGUF" / "mmproj-BF16.gguf").is_symlink())
+        self.assertTrue((self.lm / "lmstudio-community" / "gemma-GGUF" / "gemma-Q8_0.gguf").is_symlink())
+
+    def test_rm_unknown_file_exits_1(self):
+        code, _, err = run("rm", "unsloth/tiny-GGUF", "nope.gguf", "-y")
+        self.assertEqual(code, 1)
+        self.assertIn("not in", err)
+        self.assertTrue((self.store / "unsloth" / "tiny-GGUF").is_dir())
+
+    def test_rm_dry_run_touches_nothing(self):
+        run("sync", "-a", "lmstudio")
+        code, out, _ = run("rm", "unsloth/tiny-GGUF", "-n")
+        self.assertEqual(code, 0)
+        self.assertIn("DRY RUN", out)
+        self.assertIn(str(self.store / "unsloth" / "tiny-GGUF"), out)
+        self.assertTrue((self.store / "unsloth" / "tiny-GGUF" / "tiny-Q4_K_M.gguf").is_file())
+        self.assertTrue((self.lm / "unsloth" / "tiny-GGUF" / "tiny-Q4_K_M.gguf").is_symlink())
+
+    def test_rm_dry_run_never_prompts(self):
+        with mock.patch("builtins.input", side_effect=AssertionError("prompted!")):
+            code, _, _ = run("rm", "unsloth/tiny-GGUF", "-n")
+        self.assertEqual(code, 0)
+
+    def test_rm_prompts_and_abort_keeps_everything(self):
+        with mock.patch("builtins.input", return_value="n"):
+            code, out, _ = run("rm", "unsloth/tiny-GGUF")
+        self.assertEqual(code, 1)
+        self.assertIn("aborted", out)
+        self.assertTrue((self.store / "unsloth" / "tiny-GGUF").is_dir())
+
+    def test_rm_prompt_yes_deletes(self):
+        with mock.patch("builtins.input", return_value="y"):
+            code, _, _ = run("rm", "unsloth/tiny-GGUF")
+        self.assertEqual(code, 0)
+        self.assertFalse((self.store / "unsloth" / "tiny-GGUF").exists())
+
+    def test_rm_remove_alias(self):
+        code, _, _ = run("remove", "unsloth/tiny-GGUF", "-y")
+        self.assertEqual(code, 0)
+        self.assertFalse((self.store / "unsloth" / "tiny-GGUF").exists())
+
+    def test_rm_refuses_hub_cache_only_repo(self):
+        from tests.helpers import make_hf_cache
+        hub = make_hf_cache(self.base / "hub")
+        os.environ["HF_HUB_CACHE"] = str(hub)
+        os.environ["MODELCTL_SCAN_HUB"] = "1"
+        code, _, err = run("rm", "org/demo-GGUF", "-y")
+        self.assertEqual(code, 1)
+        self.assertIn("read-only", err)
+        self.assertIn("hf cache delete", err)
+        self.assertTrue((hub / "models--org--demo-GGUF" / "blobs" / "sha-deadbeef").is_file())
+
+    def test_rm_refuses_secondary_store(self):
+        extra = make_flat_store(self.base / "extra2")
+        # a model only the secondary store has
+        (extra / "acme" / "Only-There").mkdir(parents=True)
+        (extra / "acme" / "Only-There" / "model.safetensors").write_bytes(b"w")
+        (extra / "acme" / "Only-There" / "config.json").write_text('{"model_type":"llama"}')
+        os.environ["MODELCTL_STORE"] = f"{self.store}:{extra}"
+        code, _, err = run("rm", "acme/Only-There", "-y")
+        self.assertEqual(code, 1)
+        self.assertIn("read-only", err)
+        self.assertTrue((extra / "acme" / "Only-There").is_dir())
+
+    def test_rm_unknown_repo_exits_1(self):
+        code, _, err = run("rm", "no/such", "-y")
+        self.assertEqual(code, 1)
+        self.assertIn("not found", err)
+
+    def test_rm_warns_about_ollama_copy(self):
+        with mock.patch("modelctl.adapters.ollama.OllamaAdapter.imported_names",
+                        return_value={"tiny-gguf:q4_k_m"}):
+            code, out, _ = run("rm", "unsloth/tiny-GGUF", "-y")
+        self.assertEqual(code, 0)
+        self.assertIn("ollama rm tiny-gguf:q4_k_m", out)
+        self.assertIn("NOT reclaimed", out)
+
+    def test_rm_no_ollama_warning_when_not_imported(self):
+        with mock.patch("modelctl.adapters.ollama.OllamaAdapter.imported_names", return_value=set()):
+            code, out, _ = run("rm", "unsloth/tiny-GGUF", "-y")
+        self.assertEqual(code, 0)
+        self.assertNotIn("ollama rm", out)
+
+    def test_rm_symlinked_model_dir_only_unlinks(self):
+        # `modelctl adopt --link` leaves a symlinked model dir; the bytes it
+        # points at live outside the store and must survive.
+        outside = self.base / "outside" / "Linked"
+        outside.mkdir(parents=True)
+        (outside / "config.json").write_text('{"model_type":"llama"}')
+        (outside / "model.safetensors").write_bytes(b"w" * 8)
+        link = self.store / "acme" / "Linked"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(outside)
+        code, out, _ = run("rm", "acme/Linked", "-y")
+        self.assertEqual(code, 0)
+        self.assertIn("symlink only", out)
+        self.assertFalse(link.exists())
+        self.assertTrue((outside / "model.safetensors").is_file())
+
+    def test_rm_hidden_cache_files_are_not_listed(self):
+        junk = self.store / "unsloth" / "tiny-GGUF" / ".cache" / "huggingface" / "download"
+        junk.mkdir(parents=True)
+        (junk / "tiny-Q4_K_M.gguf.metadata").write_text("bookkeeping")
+        code, out, _ = run("list", "-f")
+        self.assertEqual(code, 0)
+        self.assertNotIn(".metadata", out)
+        self.assertIn("tiny-Q4_K_M.gguf", out)
+
+
+class RmGuardTest(unittest.TestCase):
+    """The path guard is the last thing standing between a typo and 150GB."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.store = self.base / "store"
+        (self.store / "acme" / "m").mkdir(parents=True)
+
+    def check(self, path, **kw):
+        from modelctl.cli import _check_removable
+        return _check_removable(self.store, Path(path), **kw)
+
+    def test_ok_inside_store(self):
+        self.assertIsNone(self.check(self.store / "acme" / "m"))
+
+    def test_rejects_dotdot_escape(self):
+        self.assertIsNotNone(self.check(self.store / "acme" / ".." / ".." / "elsewhere"))
+
+    def test_rejects_absolute_outside(self):
+        self.assertIsNotNone(self.check("/etc"))
+
+    def test_rejects_store_root_and_fs_root(self):
+        self.assertIsNotNone(self.check(self.store))
+        self.assertIsNotNone(self.check("/"))
+
+    def test_rejects_relative_path(self):
+        self.assertIsNotNone(self.check("acme/m"))
+
+    def test_rejects_symlink_escape_via_parent_dir(self):
+        # a real dir inside the store whose *parent* chain leaves the store
+        outside = self.base / "outside"
+        outside.mkdir()
+        (self.store / "acme" / "escape").symlink_to(outside)
+        self.assertIsNotNone(self.check(self.store / "acme" / "escape" / "victim"))
+
+    def test_symlink_itself_is_allowed(self):
+        outside = self.base / "outside2"
+        outside.mkdir()
+        link = self.store / "acme" / "link"
+        link.symlink_to(outside)
+        self.assertIsNone(self.check(link))  # unlinked, never followed
+
+    def test_confine_keeps_files_inside_their_model(self):
+        model = self.store / "acme" / "m"
+        other = self.store / "acme" / "other"
+        other.mkdir()
+        self.assertIsNone(self.check(model / "a.gguf", confine=model))
+        self.assertIsNotNone(self.check(other / "a.gguf", confine=model))
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -111,12 +111,17 @@ def _collect_files(repo_id: str, root: Path) -> list[ModelFile]:
             continue
         if p.suffix.lower() in SKIP_SUFFIXES:
             continue
+        rel = p.relative_to(root)
+        # hidden *directories* too: `hf download` leaves bookkeeping under
+        # .cache/huggingface/download/, which isn't part of the model.
+        if any(part.startswith(".") for part in rel.parts[:-1]):
+            continue
         real = p.resolve()
         try:
             size = real.stat().st_size
         except OSError:
             size = 0
-        out.append(ModelFile(repo_id, str(p.relative_to(root)), real, size))
+        out.append(ModelFile(repo_id, str(rel), real, size))
     return out
 
 
