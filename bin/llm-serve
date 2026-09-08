@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# llm-serve — boot any model in the modelctl store on an OpenAI-compatible
+# endpoint, via llama.cpp or LM Studio, and point Hermes at it.
+#
+#   llm-serve list                    what's in the store, and what each can do
+#   llm-serve                         default model, best available mode
+#   llm-serve <model> [mode]          llama.cpp   (port 8080)
+#   llm-serve lms <model> [mode]      LM Studio   (port 1234)
+#   llm-serve hermes                  point Hermes at whatever is running
+#   llm-serve status | stop
+#
+# modes:  auto (default) · fast (DFlash2) · mtp · vision · plain
+# env:    LLM_PORT LLM_CTX LLM_MODEL LMS_PORT MODELCTL_STORE
+set -euo pipefail
+
+DEFAULT_MODEL="${LLM_MODEL:-qwen3.8-27b}"
+PORT="${LLM_PORT:-8080}"
+LMS_PORT="${LMS_PORT:-1234}"
+CTX="${LLM_CTX:-65536}"          # Hermes refuses anything under 64K
+BIN_DFLASH="$HOME/.local/opt/llama.cpp-dflash/bin/llama-server"
+BIN_STOCK="$(command -v llama-server || true)"
+RUN="${LLM_RUN_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/llm-serve}"; mkdir -p "$RUN"
+PIDF="$RUN/llm-serve.pid"; LOGF="$RUN/llm-serve.log"; STATEF="$RUN/llm-serve.state"
+
+die(){ echo "error: $*" >&2; exit 1; }
+have_lms(){ command -v lms >/dev/null; }
+# Sibling script, so this works from a checkout without installing anything.
+PROBE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/llm-probe"
+reg(){ "$PROBE" 2>/dev/null || die "llm-probe failed ($PROBE)"; }
+
+# ---- registry lookup -------------------------------------------------------
+field(){ reg | python3 -c '
+import sys,json
+d=json.load(sys.stdin)["models"]; a,k=sys.argv[1],sys.argv[2]
+m=d.get(a)
+if m is None: sys.exit(3)
+v=m.get(k)
+print("" if v is None else (",".join(v) if isinstance(v,list) else v))' "$1" "$2"; }
+
+store_root(){ reg | python3 -c 'import sys,json;print(json.load(sys.stdin)["store"])'; }
+
+resolve_alias(){  # exact match, else unique prefix
+  reg | python3 -c '
+import sys,json
+d=json.load(sys.stdin)["models"]; a=sys.argv[1]
+if a in d: print(a); sys.exit(0)
+hits=[k for k in d if k.startswith(a)]
+if len(hits)==1: print(hits[0]); sys.exit(0)
+sys.stderr.write(("ambiguous: "+", ".join(sorted(hits))) if hits else f"unknown model: {a}")
+sys.stderr.write("\n"); sys.exit(3)' "$1"; }
+
+# ---- shared state ----------------------------------------------------------
+# line1 backend · line2 alias · line3 mode · line4 served-id
+write_state(){ printf '%s\n%s\n%s\n%s\n' "$1" "$2" "$3" "${4:-$2}" > "$STATEF"; }
+sline(){ sed -n "$1p" "$STATEF" 2>/dev/null || true; }
+
+up_llamacpp(){ curl -sf --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q '"ok"'; }
+up_lmstudio(){ have_lms && lms server status 2>&1 | grep -qi "is running"; }
+lms_loaded(){ have_lms && lms ps 2>&1 | grep -qi "^IDENTIFIER"; }
+
+endpoint(){
+  case "$(sline 1)" in
+    lmstudio) echo "http://127.0.0.1:$LMS_PORT/v1" ;;
+    llamacpp) echo "http://127.0.0.1:$PORT/v1" ;;
+    *) echo "" ;;
+  esac
+}
+
+# ---- commands --------------------------------------------------------------
+cmd_list(){
+  reg | DEF="$DEFAULT_MODEL" python3 -c '
+import sys, json, os
+d = json.load(sys.stdin)
+default = os.environ.get("DEF", "")
+print("store: %s\n" % d["store"])
+print("%-28s%-6s%7s  %-28s%s" % ("  MODEL", "FMT", "SIZE", "MODES", "BACKENDS"))
+print("-" * 84)
+for k, v in sorted(d["models"].items()):
+    modes = []
+    if v["dflash"]: modes.append("fast")
+    if v["mtp"]:    modes.append("mtp")
+    if v["mmproj"]: modes.append("vision")
+    modes.append("plain")
+    name = k if len(k) <= 25 else k[:24] + "\u2026"
+    print("%s%-26s%-6s%7s  %-28s%s" % (
+        "* " if k == default else "  ", name, v["format"],
+        "%.1fG" % v["size_gb"], ",".join(modes), ",".join(v["backends"])))
+print("\n* default   fast=DFlash2 drafter   mtp=built-in head   vision=image input")'
+}
+
+cmd_status(){
+  if [[ "$(sline 1)" == "lmstudio" ]] && up_lmstudio && lms_loaded; then
+    echo "up   backend=lmstudio  port=$LMS_PORT  model=$(sline 2)  mode=$(sline 3)"
+    lms ps 2>&1 | grep -v '^$' | sed -n '1,4p' | sed 's/^/     /'
+    return 0
+  fi
+  if up_llamacpp; then
+    echo "up   backend=llamacpp  port=$PORT  model=$(sline 2)  mode=$(sline 3)"
+    curl -s "http://127.0.0.1:$PORT/v1/models" 2>/dev/null \
+      | python3 -c 'import sys,json;[print("     served:",m["id"]) for m in json.load(sys.stdin)["data"]]' 2>/dev/null || true
+    return 0
+  fi
+  echo "down"; return 1
+}
+
+cmd_stop(){
+  local stopped=0
+  if [[ -f "$PIDF" ]] && kill -0 "$(cat "$PIDF")" 2>/dev/null; then
+    kill "$(cat "$PIDF")"; rm -f "$PIDF"; echo "stopped llama.cpp"; stopped=1
+  elif pkill -f "llama-server.*--port $PORT" 2>/dev/null; then
+    echo "stopped llama.cpp (by match)"; stopped=1
+  fi
+  if lms_loaded; then
+    lms unload --all >/dev/null 2>&1 && { echo "unloaded LM Studio model"; stopped=1; }
+  fi
+  rm -f "$STATEF"
+  [[ $stopped -eq 1 ]] || echo "nothing running"
+}
+
+cmd_hermes(){
+  local url; url="$(endpoint)"
+  [[ -n "$url" ]] || die "nothing running; start a model first"
+  local served; served="$(sline 4)"
+  hermes config set model.provider llamacpp >/dev/null
+  hermes config set model.base_url "$url" >/dev/null
+  hermes config set model.default "$served" >/dev/null
+  echo "hermes → $url   (model: $served)"
+}
+
+pick_mode(){
+  local a="$1" want="${2:-auto}" dflash mtp mmproj
+  dflash="$(field "$a" dflash)"; mtp="$(field "$a" mtp)"; mmproj="$(field "$a" mmproj)"
+  case "$want" in
+    auto)
+      if   [[ -n "$dflash" && -x "$BIN_DFLASH" ]]; then echo fast
+      elif [[ "$mtp" == "True" ]];                 then echo mtp
+      else echo plain; fi ;;
+    fast)   [[ -n "$dflash" ]] || die "$a has no DFlash2 drafter in the store"
+            [[ -x "$BIN_DFLASH" ]] || die "DFlash build missing: $BIN_DFLASH"; echo fast ;;
+    mtp)    [[ "$mtp" == "True" ]] || die "$a has no built-in MTP head"; echo mtp ;;
+    vision) [[ -n "$mmproj" ]] || die "$a has no mmproj (not a vision model)"; echo vision ;;
+    plain)  echo plain ;;
+    *) die "unknown mode: $want (auto|fast|mtp|vision|plain)" ;;
+  esac
+}
+
+cmd_llamacpp(){
+  local a mode; a="$(resolve_alias "$1")" || exit 3
+  [[ "$(field "$a" backends)" == *llamacpp* ]] \
+    || die "$a is MLX; llama.cpp cannot load it. Try: llm-serve lms $a"
+  mode="$(pick_mode "$a" "${2:-auto}")"
+  local model; model="$(field "$a" path)"
+  [[ -f "$model" ]] || die "missing weights: $model"
+  if up_llamacpp; then
+    # State can be missing (server started by hand, or state dir moved), so
+    # ask the server what it is actually serving rather than printing blanks.
+    local now; now="$(sline 2)"
+    [[ -n "$now" ]] || now="$(curl -s --max-time 2 "http://127.0.0.1:$PORT/v1/models" 2>/dev/null \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null)"
+    local m; m="$(sline 3)"
+    if [[ "$now" == "$a" ]]; then
+      echo "already serving $a${m:+ [$m]} on port $PORT"
+    else
+      echo "port $PORT is serving ${now:-an unknown model}${m:+ [$m]}, not $a"
+      echo "run 'llm-serve stop' first, or set LLM_PORT to use another port"
+    fi
+    exit 0
+  fi
+
+  local bin="${BIN_STOCK:-$BIN_DFLASH}"
+  # --jinja gives tool-calling from the model's own template; deepseek
+  # reasoning-format keeps <think> out of message.content for agents.
+  # -b/-ub at llama.cpp's defaults: measured fastest here. A smaller -b costs
+  # ~20% prefill, a larger one is no better.
+  local -a cmd=( -m "$model" -c "$CTX" -ngl 999 -fa 1 -b 2048 -ub 512
+                 --host 127.0.0.1 --port "$PORT" --jinja
+                 --reasoning-format deepseek --alias "$a" )
+  case "$mode" in
+    fast)   bin="$BIN_DFLASH"
+            # -ngld matters: -ngl offloads only the target, not the drafter.
+            cmd+=( -md "$(field "$a" dflash)" -ngld 999
+                   --spec-type draft-dflash --spec-draft-n-max 4 --parallel 1 ) ;;
+    mtp)    cmd+=( --spec-type draft-mtp --spec-draft-n-max 3 --parallel 1 ) ;;
+    vision) cmd+=( --mmproj "$(field "$a" mmproj)" --image-min-tokens 1024 ) ;;
+  esac
+  [[ -x "$bin" ]] || die "no llama-server available (brew install llama.cpp)"
+
+  echo "starting: $a [$mode] on llama.cpp  (port $PORT, ctx $CTX)"
+  nohup "$bin" "${cmd[@]}" > "$LOGF" 2>&1 &
+  echo $! > "$PIDF"; write_state llamacpp "$a" "$mode"
+  printf "loading %sG" "$(field "$a" size_gb)"
+  for _ in $(seq 1 210); do
+    up_llamacpp && { echo " ready"; cmd_status; exit 0; }
+    kill -0 "$(cat "$PIDF")" 2>/dev/null || { echo; echo "server died:"; tail -15 "$LOGF"; exit 1; }
+    printf "."; sleep 2
+  done
+  echo; die "timed out after 420s; see $LOGF"
+}
+
+lms_key(){  # alias → LM Studio model key, matched on store-relative path
+  local p repo relp; p="$(field "$1" path)"; repo="$(field "$1" repo)"
+  relp="${p#"$(store_root)/"}"
+  lms ls --json 2>/dev/null | python3 -c '
+import sys,json
+rows=[m for m in json.load(sys.stdin) if m.get("type")=="llm"]
+relp,repo,alias=sys.argv[1],sys.argv[2],sys.argv[3]
+for m in rows:
+    if m.get("path") in (relp,repo): print(m["modelKey"]); sys.exit(0)
+for m in rows:
+    if alias in m["modelKey"].lower().replace("/","-"): print(m["modelKey"]); sys.exit(0)
+sys.exit(3)' "$relp" "$repo" "$1"; }
+
+cmd_lmstudio(){
+  have_lms || die "lms not found (install the LM Studio CLI)"
+  local a mode key; a="$(resolve_alias "$1")" || exit 3
+  mode="$(pick_mode "$a" "${2:-auto}")"
+  # LM Studio has no DFlash; auto/fast fall back to its MTP toggle.
+  [[ "$mode" == "fast" ]] && { [[ "$(field "$a" mtp)" == "True" ]] && mode=mtp || mode=plain; }
+  key="$(lms_key "$a")" || die "$a is not indexed by LM Studio (open the app once to rescan)"
+
+  up_lmstudio || { echo "starting LM Studio server on $LMS_PORT..."; lms server start --port "$LMS_PORT" >/dev/null; }
+  lms_loaded && lms unload --all >/dev/null 2>&1 || true
+
+  local -a args=( "$key" --context-length "$CTX" --gpu max -y )
+  [[ "$mode" == "mtp" ]] && args+=( --speculative-draft-mtp --speculative-draft-max-tokens 3 )
+  echo "starting: $a [$mode] on LM Studio  (port $LMS_PORT, ctx $CTX, key $key)"
+  if ! lms load "${args[@]}" 2>&1 | tr '\r' '\n' | grep -aiE "loaded successfully|error|failed|identifier \"" | tail -3; then
+    die "lms load failed; run: lms load $key"
+  fi
+  write_state lmstudio "$a" "$mode" "$key"
+  cmd_status
+}
+
+case "${1:-}" in
+  list)      cmd_list ;;
+  status)    cmd_status ;;
+  stop)      cmd_stop ;;
+  hermes)    cmd_hermes ;;
+  lms)       shift; [[ $# -ge 1 ]] || die "usage: llm-serve lms <model> [mode]"; cmd_lmstudio "$@" ;;
+  ""|auto)   cmd_llamacpp "$DEFAULT_MODEL" auto ;;
+  -h|--help) sed -n '2,14p' "$0" | sed 's/^# \?//' ;;
+  fast|mtp|vision|plain) cmd_llamacpp "$DEFAULT_MODEL" "$1" ;;
+  *)         cmd_llamacpp "$1" "${2:-auto}" ;;
+esac

@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Probe the modelctl store and emit a capability registry as JSON.
+
+Reads each GGUF's real header (metadata KVs + tensor names) rather than
+grepping strings, so MTP detection is exact. Results are cached by
+(path, size, mtime) because parsing a tokenizer's KV block isn't free.
+
+  llm-probe            print the registry
+  llm-probe --refresh  ignore the cache and re-parse
+"""
+from __future__ import annotations
+
+import json
+import os
+import struct
+import sys
+from pathlib import Path
+
+# Same resolution modelctl uses: the repo's own models/ folder, overridable
+# with MODELCTL_STORE (first entry wins when it's a colon-separated list).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+_store_env = os.environ.get("MODELCTL_STORE")
+STORE = (Path(_store_env.split(":")[0]).expanduser() if _store_env
+         else REPO_ROOT / "models")
+
+_state = os.environ.get("LLM_RUN_DIR") or os.environ.get("XDG_STATE_HOME")
+STATE_DIR = (Path(_state).expanduser() / ("" if os.environ.get("LLM_RUN_DIR") else "llm-serve")
+             if _state else Path.home() / ".local/state/llm-serve")
+CACHE = STATE_DIR / "llm-registry.json"
+
+_SCALAR = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i",
+           6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+
+
+def _read_gguf(path: Path) -> dict | None:
+    """Return {arch, n_tensors, has_mtp, ctx} or None if not a readable GGUF."""
+    try:
+        with open(path, "rb") as fh:
+            if fh.read(4) != b"GGUF":
+                return None
+            struct.unpack("<I", fh.read(4))
+            n_tensors = struct.unpack("<Q", fh.read(8))[0]
+            n_kv = struct.unpack("<Q", fh.read(8))[0]
+
+            def rstr() -> str:
+                n = struct.unpack("<Q", fh.read(8))[0]
+                return fh.read(n).decode("utf-8", "replace")
+
+            def rval(t: int):
+                if t == 8:
+                    return rstr()
+                if t == 9:
+                    et = struct.unpack("<I", fh.read(4))[0]
+                    n = struct.unpack("<Q", fh.read(8))[0]
+                    return [rval(et) for _ in range(n)]
+                fmt = _SCALAR[t]
+                return struct.unpack(fmt, fh.read(struct.calcsize(fmt)))[0]
+
+            arch, ctx = None, None
+            for _ in range(n_kv):
+                k = rstr()
+                v = rval(struct.unpack("<I", fh.read(4))[0])
+                if k == "general.architecture":
+                    arch = v
+                elif k.endswith(".context_length") and ctx is None:
+                    ctx = v
+
+            # Tensor names follow the KV block; nextn.* means a built-in MTP head.
+            has_mtp = False
+            for _ in range(n_tensors):
+                name = rstr()
+                nd = struct.unpack("<I", fh.read(4))[0]
+                fh.read(8 * nd)
+                fh.read(4)
+                fh.read(8)
+                if ".nextn." in name:
+                    has_mtp = True
+            return {"arch": arch, "n_tensors": n_tensors,
+                    "has_mtp": has_mtp, "ctx": ctx}
+    except (OSError, struct.error, KeyError, UnicodeDecodeError):
+        return None
+
+
+def _alias(repo: str) -> str:
+    """Short, typeable name: publisher dropped, noise suffixes trimmed."""
+    name = repo.split("/")[-1]
+    for suffix in ("-GGUF", "-MTP-GGUF", "-it-GGUF"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    for suffix in ("-MLX-8bit", "-8bit", "-it"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    return name.lower().replace("_", "-")
+
+
+def _claim(models: dict[str, dict], alias: str, entry: dict) -> None:
+    """Insert under `alias`, disambiguating by format then publisher.
+
+    Two repos can reduce to the same short name (a GGUF build and an MLX
+    build of one model), and silently overwriting would hide a model from
+    the registry entirely.
+    """
+    if alias not in models:
+        models[alias] = entry
+        return
+    incumbent = models.pop(alias)
+    for name, item in ((alias, incumbent), (alias, entry)):
+        key = f"{name}-{item['format']}"
+        if key in models:
+            key = f"{item['repo'].split('/')[0].lower()}-{key}"
+        models[key] = item
+
+
+def build() -> dict:
+    models: dict[str, dict] = {}
+    if not STORE.is_dir():
+        return {"store": str(STORE), "models": {}}
+
+    # DFlash drafters are indexed first so targets can point at them.
+    drafters: dict[str, str] = {}
+    for pub in sorted(STORE.iterdir()):
+        if not pub.is_dir():
+            continue
+        for repo in sorted(pub.iterdir()):
+            if not repo.is_dir() or "DFlash" not in repo.name:
+                continue
+            gg = sorted(repo.glob("*.gguf"))
+            if gg:
+                # "Qwen3.8-27B-DFlash2-GGUF" -> keyed by "Qwen3.8-27B"
+                drafters[repo.name.split("-DFlash")[0]] = str(gg[0])
+
+    for pub in sorted(STORE.iterdir()):
+        if not pub.is_dir() or pub.name.startswith("."):
+            continue
+        for repo in sorted(pub.iterdir()):
+            if not repo.is_dir() or repo.name.startswith("."):
+                continue
+            if "DFlash" in repo.name:
+                continue
+            rel = f"{pub.name}/{repo.name}"
+
+            weights = [p for p in sorted(repo.glob("*.gguf"))
+                       if not p.name.startswith("mmproj")]
+            mmproj = sorted(repo.glob("mmproj*.gguf"))
+            is_mlx = (repo / "config.json").is_file() and not weights
+
+            if weights:
+                main = weights[0]
+                info = _read_gguf(main) or {}
+                entry = {
+                    "repo": rel,
+                    "format": "gguf",
+                    "path": str(main),
+                    "size_gb": round(main.stat().st_size / 1e9, 1),
+                    "mmproj": str(mmproj[0]) if mmproj else None,
+                    "mtp": bool(info.get("has_mtp")),
+                    "arch": info.get("arch"),
+                    "max_ctx": info.get("ctx"),
+                    "dflash": None,
+                    "backends": ["llamacpp", "lmstudio"],
+                }
+                for stem, dpath in drafters.items():
+                    if repo.name.startswith(stem):
+                        entry["dflash"] = dpath
+                        break
+                _claim(models, _alias(rel), entry)
+            elif is_mlx:
+                _claim(models, _alias(rel), {
+                    "repo": rel,
+                    "format": "mlx",
+                    "path": str(repo),
+                    "size_gb": round(sum(
+                        p.stat().st_size for p in repo.rglob("*") if p.is_file()
+                    ) / 1e9, 1),
+                    "mmproj": None, "mtp": False, "arch": None, "max_ctx": None,
+                    "dflash": None,
+                    # MLX runs under LM Studio's MLX runtime; llama.cpp can't load it.
+                    "backends": ["lmstudio"],
+                })
+    return {"store": str(STORE), "models": models}
+
+
+def main() -> int:
+    refresh = "--refresh" in sys.argv
+    if not refresh and CACHE.is_file():
+        try:
+            cached = json.loads(CACHE.read_text())
+            stamp = {p.name: p.stat().st_mtime_ns
+                     for p in STORE.iterdir() if p.is_dir()} if STORE.is_dir() else {}
+            if cached.get("_stamp") == stamp:
+                print(json.dumps(cached, indent=2))
+                return 0
+        except (OSError, ValueError):
+            pass
+
+    reg = build()
+    if STORE.is_dir():
+        reg["_stamp"] = {p.name: p.stat().st_mtime_ns
+                         for p in STORE.iterdir() if p.is_dir()}
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE.write_text(json.dumps(reg, indent=2))
+    print(json.dumps(reg, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
