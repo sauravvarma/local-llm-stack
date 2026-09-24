@@ -14,7 +14,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..cache import Repo
+from ..cache import CACHE_DIRNAME, Repo
 
 
 @dataclass
@@ -44,6 +44,68 @@ class Adapter:
 
     def doctor(self) -> list[str]:
         return []
+
+
+def ensure_hardlink_tree(target: Path, source: Path, adapter: str, *, dry_run: bool) -> Action:
+    """Mirror `source`'s file tree into `target` with real dirs + hard links,
+    reported as ONE action for the whole package.
+
+    Why hard links: the Splash indexer resolves real paths and rejects both a
+    symlinked package ("escapes the models directory") and symlinked artifacts
+    inside a real package dir ("path escapes its directory"). A hard link has
+    no separate real path, so it passes both checks, and on one filesystem it
+    shares inodes and so costs no extra bytes.
+
+    Idempotent by inode: a file already hard-linked to its source is left
+    alone, and one whose source was REPLACED (a re-download writes a new inode)
+    is relinked, so a stale mirror repairs itself on the next sync."""
+    if not _same_filesystem(source, target):
+        return Action(adapter, "skip", str(target),
+                      "cannot hard-link across filesystems; point this app's models dir "
+                      "at the store, or copy the package in")
+    linked = relinked = uptodate = 0
+    for src in sorted(source.rglob("*")):
+        if src.is_dir() or CACHE_DIRNAME in src.parts:
+            continue
+        dst = target / src.relative_to(source)
+        try:
+            ds, ss = dst.stat(), src.stat()
+            if (ds.st_ino, ds.st_dev) == (ss.st_ino, ss.st_dev):
+                uptodate += 1
+                continue
+            stale = True
+        except OSError:
+            stale = dst.is_symlink()   # a broken symlink still needs replacing
+        if not dry_run:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if stale:
+                dst.unlink()
+            os.link(src, dst)
+        if stale:
+            relinked += 1
+        else:
+            linked += 1
+    if linked == relinked == 0:
+        return Action(adapter, "skip", str(target), f"up to date ({uptodate} hard links)")
+    op = "relink" if relinked and not linked else "link"
+    bits = [f"{linked} new"] if linked else []
+    if relinked:
+        bits.append(f"{relinked} stale")
+    if uptodate:
+        bits.append(f"{uptodate} unchanged")
+    return Action(adapter, op, str(target), f"hard links: {', '.join(bits)} (no extra bytes)")
+
+
+def _same_filesystem(a: Path, b: Path) -> bool:
+    """Compare st_dev of `a` and of `b`'s nearest EXISTING ancestor, since the
+    target itself usually doesn't exist yet."""
+    probe = b
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        return a.stat().st_dev == probe.stat().st_dev
+    except OSError:
+        return False
 
 
 def ensure_symlink(target: Path, source: Path, adapter: str, *, dry_run: bool) -> Action:

@@ -52,6 +52,26 @@ def make_flat_store(root: Path) -> Path:
     write(st / "model-00002-of-00002.safetensors")
     write_config(st / "config.json", {"model_type": "qwen3"})
 
+    # splash (Splash package): manifest.json + .bin shards, NO root config.json.
+    # Without manifest detection this would fall through to "safetensors".
+    splash = root / "incoai" / "Demo-Splash"
+    write(splash / "target" / "layer-0.bin")
+    write(splash / "target" / "embedding.bin")
+    write(splash / "draft" / "layer-0.bin")
+    write_config(splash / "tokenizer" / "config.json", {"model_type": "qwen3"})
+    write_config(splash / "manifest.json", {
+        "schema_version": 3,
+        "model": "Demo",
+        "format": {"name": "splash-packed-q4", "q4_bits": 4},
+        "artifacts": [{"path": "target/layer-0.bin", "sha256": "ab", "size": 16}],
+    })
+
+    # decoy: a generic manifest.json must NOT be read as a Splash package
+    decoy = root / "someone" / "Not-Splash"
+    write(decoy / "model.safetensors")
+    write_config(decoy / "config.json", {"model_type": "llama"})
+    write_config(decoy / "manifest.json", {"name": "some-npm-thing", "version": "1.0.0"})
+
     # bare model dir (no publisher level): files directly under a top-level dir
     bare = root / "BareModel"
     write(bare / "model.safetensors")
@@ -91,6 +111,8 @@ FLAT_FORMATS = {
     "bartowski/split-GGUF": "gguf",
     "mlx-community/gemma-8bit": "mlx",
     "someone/Model-MLX-4bit": "mlx",
+    "incoai/Demo-Splash": "splash",
+    "someone/Not-Splash": "safetensors",
     "Qwen/Qwen3-7B": "safetensors",
     "BareModel": "safetensors",
 }
@@ -100,7 +122,7 @@ class EnvTestCase(unittest.TestCase):
     """Snapshot/restore the env vars modelctl reads, so tests don't leak."""
 
     ENV_KEYS = ("MODELCTL_STORE", "MODELCTL_SCAN_HUB", "MODELCTL_LMSTUDIO_DIR",
-                "HF_HOME", "HF_HUB_CACHE")
+                "MODELCTL_BIONIC_DIR", "HF_HOME", "HF_HUB_CACHE")
 
     def setUp(self):
         self._saved = {k: os.environ.get(k) for k in self.ENV_KEYS}

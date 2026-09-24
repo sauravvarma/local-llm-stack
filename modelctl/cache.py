@@ -6,11 +6,12 @@ Two store layouts are supported, no dependencies (stock python3):
             <root>/<model>/<files…>                   and LM Studio produce — GUI-friendly)
   hf-cache  <root>/models--<org>--<name>/snapshots/<commit>/…  (HF hub cache layout)
 
-Every store yields the same `Repo`/`ModelFile` view, classified into one of four
+Every store yields the same `Repo`/`ModelFile` view, classified into one of five
 formats so adapters know which tools can consume each model:
 
   gguf         -> llama.cpp / LM Studio / ollama
   mlx          -> MLX-quantized safetensors; mlx_lm / LM Studio only
+  splash         -> Splash-packed weights; the splash engine only
   safetensors  -> full-precision / GPTQ / AWQ; vLLM / transformers / mlx_lm
   other        -> unclassified
 """
@@ -23,6 +24,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 GGUF_EXTS = {".gguf"}
+SPLASH_MANIFEST = "manifest.json"
+# scratch dir `hf download` leaves inside a --local-dir target
+CACHE_DIRNAME = ".cache"
 WEIGHT_EXTS = {".safetensors", ".bin", ".pt", ".pth", ".npz"}
 SKIP_NAMES = {".DS_Store"}
 # in-progress / scratch files an in-flight download leaves behind
@@ -48,7 +52,7 @@ class ModelFile:
 @dataclass
 class Repo:
     repo_id: str          # "publisher/model" (or bare "model")
-    fmt: str              # gguf | mlx | safetensors | other
+    fmt: str              # gguf | mlx | splash | safetensors | other
     store: str            # which store it came from (label)
     root: Path            # the model's directory (what tools load)
     files: list[ModelFile] = field(default_factory=list)
@@ -84,9 +88,36 @@ def _read_config(root: Path) -> dict | None:
     return None
 
 
+def splash_manifest(root: Path) -> dict | None:
+    """A Splash package self-describes in a root `manifest.json`: a `format`
+    block naming the packing (e.g. "splash-packed-q4") plus an `artifacts` list
+    of path/sha256/size entries. Both are required, so a generic manifest.json
+    (npm, a web app, a plain HF repo) can't be mistaken for one.
+
+    Returns the parsed manifest, or None if this isn't a Splash package."""
+    path = root / SPLASH_MANIFEST
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (ValueError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    fmt = data.get("format")
+    if isinstance(fmt, dict) and fmt.get("name") and isinstance(data.get("artifacts"), list):
+        return data
+    return None
+
+
 def classify(repo_id: str, root: Path, files: list[ModelFile]) -> str:
     if any(f.is_gguf for f in files):
         return "gguf"
+    # Before the weight-extension checks: a Splash package is .bin shards with
+    # no root config.json, which would otherwise fall through to "safetensors"
+    # and be offered to vLLM/mlx_lm, neither of which can load it.
+    if splash_manifest(root) is not None:
+        return "splash"
     has_weights = any(Path(f.filename).suffix.lower() in WEIGHT_EXTS for f in files)
     cfg = _read_config(root)
     if cfg is not None:
@@ -121,6 +152,10 @@ def _collect_files(repo_id: str, root: Path) -> list[ModelFile]:
 
 
 def _has_model_files(d: Path, *, recursive: bool = False) -> bool:
+    # A Splash package is identified by its manifest, not by an extension: its
+    # weights are plain .bin shards and it has no root config.json.
+    if splash_manifest(d) is not None:
+        return True
     for p in (d.rglob("*") if recursive else d.iterdir()):
         if (
             p.is_file()

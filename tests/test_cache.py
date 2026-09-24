@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from modelctl.cache import (
-    classify, find_repo, human_size, scan_flat, scan_hf_cache,
+    classify, find_repo, human_size, scan_flat, scan_hf_cache, splash_manifest,
 )
 from tests.helpers import FLAT_FORMATS, make_flat_store, make_hf_cache, write, write_config
 
@@ -57,6 +58,68 @@ class ClassifyTest(unittest.TestCase):
         from modelctl.cache import ModelFile
         files = [ModelFile("r/x", "README.md", self.root / "README.md", 0)]
         self.assertEqual(classify("r/x", self.root, files), "other")
+
+
+class SplashManifestTest(unittest.TestCase):
+    """Detection must be strict: `manifest.json` is a common filename, and a
+    false positive would hide a real safetensors model from vLLM/mlx_lm."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def manifest(self, obj):
+        (self.root / "manifest.json").write_text(
+            obj if isinstance(obj, str) else json.dumps(obj))
+
+    def files(self, *names):
+        from modelctl.cache import ModelFile
+        return [ModelFile("r/x", n, self.root / n, 0) for n in names]
+
+    def test_detects_a_splash_package(self):
+        self.manifest({"format": {"name": "splash-packed-q4"},
+                       "artifacts": [{"path": "target/layer-0.bin"}]})
+        self.assertIsNotNone(splash_manifest(self.root))
+        self.assertEqual(classify("incoai/X-Splash", self.root, self.files("target/layer-0.bin")), "splash")
+
+    def test_splash_beats_safetensors_fallthrough(self):
+        """The bug this closes: .bin shards + no root config.json -> safetensors."""
+        self.manifest({"format": {"name": "splash-packed-q4"}, "artifacts": []})
+        self.assertEqual(classify("incoai/X", self.root, self.files("target/a.bin")), "splash")
+
+    def test_splash_beats_mlx_by_name(self):
+        """Splash packages are converted FROM mlx-community repos, so the name
+        can contain 'mlx' without the package being an MLX checkpoint."""
+        self.manifest({"format": {"name": "splash-packed-q4"}, "artifacts": []})
+        self.assertEqual(classify("incoai/Qwen-MLX-Splash", self.root, self.files("target/a.bin")), "splash")
+
+    def test_gguf_still_wins(self):
+        self.manifest({"format": {"name": "splash-packed-q4"}, "artifacts": []})
+        self.assertEqual(classify("r/x", self.root, self.files("a.gguf")), "gguf")
+
+    def test_generic_manifest_is_not_splash(self):
+        self.manifest({"name": "some-npm-package", "version": "1.0.0"})
+        self.assertIsNone(splash_manifest(self.root))
+
+    def test_format_without_artifacts_is_not_splash(self):
+        self.manifest({"format": {"name": "splash-packed-q4"}})
+        self.assertIsNone(splash_manifest(self.root))
+
+    def test_artifacts_without_format_is_not_splash(self):
+        self.manifest({"artifacts": [{"path": "a.bin"}]})
+        self.assertIsNone(splash_manifest(self.root))
+
+    def test_malformed_json_is_not_splash(self):
+        self.manifest("{not json")
+        self.assertIsNone(splash_manifest(self.root))
+
+    def test_non_dict_manifest_is_not_splash(self):
+        self.manifest([1, 2, 3])
+        self.assertIsNone(splash_manifest(self.root))
+
+    def test_missing_manifest_is_not_splash(self):
+        self.assertIsNone(splash_manifest(self.root))
 
 
 class ScanFlatTest(unittest.TestCase):

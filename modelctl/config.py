@@ -11,6 +11,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .adapters.bionic import BionicDir, models_dir as bionic_models_dir
 from .cache import Repo, hub_dir, scan_flat, scan_hf_cache
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +34,7 @@ class Config:
     hub: Path                   # HF hub cache (scanned read-only)
     scan_hub: bool
     lmstudio_dir: Path
+    bionic: BionicDir           # Bionic's models dir + how it was resolved
 
     @classmethod
     def load(cls) -> "Config":
@@ -46,6 +48,9 @@ class Config:
             # LM Studio is pointed at the store, so it reads it natively; only
             # out-of-store models (e.g. in the HF cache) get symlinked in.
             lmstudio_dir=_env_path("MODELCTL_LMSTUDIO_DIR", stores[0]),
+            # Bionic keeps its own downloadsFolder (default ~/.lmstudio/models),
+            # so it usually needs a real projection. Override: MODELCTL_BIONIC_DIR.
+            bionic=bionic_models_dir(),
         )
 
     def scan(self) -> list[Repo]:

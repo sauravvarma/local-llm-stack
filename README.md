@@ -22,11 +22,30 @@ models/
 
 Each model is classified from its files/`config.json`; adapters accept by capability.
 
-| format | how detected | vLLM | mlx_lm | LM Studio | llama.cpp | ollama |
-|--------|--------------|:----:|:------:|:---------:|:---------:|:------:|
-| **gguf** | `*.gguf` | – | – | ✓ symlink | ✓ symlink | ✓ *copy* |
-| **mlx** | top-level `quantization` in config / name `*MLX*` | – | ✓ path | ✓ dir symlink | – | – |
-| **safetensors** | `*.safetensors` + `config.json` (full / GPTQ / AWQ) | ✓ path | ✓ path | – | – | – |
+| format | how detected | vLLM | mlx_lm | splash | LM Studio / Bionic | llama.cpp | ollama |
+|--------|--------------|:----:|:------:|:------:|:------------------:|:---------:|:------:|
+| **gguf** | `*.gguf` | – | – | – | ✓ symlink | ✓ symlink | ✓ *copy* |
+| **mlx** | top-level `quantization` in config / name `*MLX*` | – | ✓ path | – | ✓ dir symlink | – | – |
+| **splash** | root `manifest.json` with `format.name` + `artifacts` | – | – | ✓ path | ✓ hard link¹ | – | – |
+| **safetensors** | `*.safetensors` + `config.json` (full / GPTQ / AWQ) | ✓ path | ✓ path | – | – | – | – |
+
+¹ Splash is the one format the LM Studio family cannot reach by symlink. Its
+indexer resolves real paths and enforces containment twice, so `sync` mirrors
+the package with real directories plus per-file **hard links** instead. Tried
+against Bionic 1.1.5:
+
+| projection | result |
+|---|---|
+| directory symlink | `Model package escapes the models directory: <pkg>` |
+| per-file symlinks | `Model package path escapes its directory: <pkg>/manifest.json` |
+| per-file hard links | indexed, `"format": "splash"` |
+
+A hard link has no separate real path, so both checks pass, and sharing inodes
+means the mirror costs nothing (17.4 GB mirrored with no change in free space).
+It needs one filesystem: across filesystems `sync` skips with an explanation.
+Because inodes are shared, deleting the package from the store does not reclaim
+space until the mirror goes too, and a re-download (new inode) is repaired by
+inode comparison on the next sync.
 
 How each tool is served:
 
@@ -35,6 +54,27 @@ How each tool is served:
   launch command (`vllm serve <path>`, `mlx_lm.generate --model <path>`).
 - **LM Studio** — symlinked into `~/.lmstudio/models/<pub>/<model>` (a directory
   for MLX, per-file for GGUF). LM Studio follows the symlinks.
+- **Bionic**: LM Studio's sibling app (same llama.cpp + mlx-llm runtimes), so
+  the same projection. It shares the LM Studio home but keeps its own settings
+  at `<home>/apps/bionic/settings.json`, and its `downloadsFolder` defaults to
+  `<home>/models` rather than wherever LM Studio points, so it usually needs a
+  real sync even when LM Studio reads the store natively. The adapter reads that
+  setting (and `~/.lmstudio-home-pointer`) instead of assuming the default, so
+  changing the folder in Bionic's UI doesn't leave `sync` writing somewhere dead.
+  Its ExecuTorch ASR runtime (`.pte` speech models) is app-managed and out of scope.
+  Both apps can also load `splash` via the `splash` backend extension, which
+  installs into the shared `<home>/extensions/backends/` behind the
+  `splashEngine` experiment flag. Splash is not symlinkable though (see note ¹),
+  so in practice an app serves splash only when its models dir is the store.
+  That's true of LM Studio here and not of Bionic, whose `downloadsFolder`
+  defaults to `<home>/models`.
+- **Splash** (`splash`): Inco AI's Apple-silicon engine. Reads the package
+  directory directly, so no projection: `splash serve --model <path>`. A splash
+  package is `manifest.json` + `target/` + `draft/` + `vision/` + `tokenizer/`,
+  with plain `.bin` shards and no root `config.json`, so it's detected by its
+  manifest rather than by a file extension. It loads nowhere else: vLLM and
+  mlx_lm are explicitly excluded, even though the `.bin` shards would otherwise
+  look like generic weights.
 - **llama.cpp** — `modelctl resolve <repo>` → path for `-m`, plus a flat symlink
   library at `~/models/gguf/`.
 - **Ollama** — the outlier: its content-addressed blob store can't symlink, so
@@ -64,6 +104,7 @@ bin/modelctl ollama-import <repo> [file] --name name:tag
 | `MODELCTL_SCAN_HUB` | `1` | also scan the HF cache (`0` to disable) |
 | `HF_HOME` / `HF_HUB_CACHE` | `~/.cache/huggingface` | HF cache location |
 | `MODELCTL_LMSTUDIO_DIR` | `~/.lmstudio/models` | LM Studio's models root |
+| `MODELCTL_BIONIC_DIR` | Bionic's `downloadsFolder` | Bionic's models root (overrides its settings) |
 | `MODELCTL_GGUF_DIR` | `~/models/gguf` | flat GGUF library for llama.cpp |
 
 > The `models/` folder is gitignored (large binaries, never committed) and so
