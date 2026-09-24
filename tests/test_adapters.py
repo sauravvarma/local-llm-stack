@@ -393,6 +393,24 @@ class SplashRoutingTest(AdapterBase):
         self.assertTrue((bio / "unsloth" / "tiny-GGUF" / "tiny-Q4_K_M.gguf").is_symlink())
 
 
+class QuantMethodRoutingTest(AdapterBase):
+    """GPTQ/AWQ are safetensors too, but mlx_lm cannot load them. Same class of
+    bug as splash: the container format alone is not enough to route on."""
+
+    def test_mlx_rejects_gptq(self):
+        self.assertFalse(MlxAdapter().accepts(self.repo("TheBloke/Demo-GPTQ")))
+
+    def test_mlx_still_accepts_plain_safetensors(self):
+        self.assertTrue(MlxAdapter().accepts(self.repo("Qwen/Qwen3-7B")))
+
+    def test_vllm_accepts_gptq(self):
+        self.assertTrue(VllmAdapter().accepts(self.repo("TheBloke/Demo-GPTQ")))
+
+    def test_quant_method_is_recorded_on_the_repo(self):
+        self.assertEqual(self.repo("TheBloke/Demo-GPTQ").quant_method, "gptq")
+        self.assertEqual(self.repo("Qwen/Qwen3-7B").quant_method, "")
+
+
 class VllmAdapterTest(AdapterBase):
     def test_accepts_safetensors_only(self):
         ad = VllmAdapter()

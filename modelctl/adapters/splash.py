@@ -24,7 +24,7 @@ class SplashAdapter(Adapter):
     def accepts(self, repo: Repo) -> bool:
         return repo.fmt == "splash"
 
-    def sync(self, repos: list[Repo], *, dry_run: bool = False) -> list[Action]:
+    def sync(self, repos: list[Repo], *, dry_run: bool = False, **options) -> list[Action]:
         return [
             Action(self.name, "native", r.repo_id, f"splash serve --model {r.root}")
             for r in repos if self.accepts(r)

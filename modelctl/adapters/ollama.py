@@ -31,7 +31,9 @@ class OllamaAdapter(Adapter):
     def accepts(self, repo: Repo) -> bool:
         return repo.fmt == "gguf"
 
-    def sync(self, repos: list[Repo], *, dry_run: bool = False, do_import: bool = False) -> list[Action]:
+    def sync(self, repos: list[Repo], *, dry_run: bool = False, **options) -> list[Action]:
+        """`import_ollama=True` opts into copying bytes into ollama's store."""
+        do_import = bool(options.get("import_ollama"))
         actions: list[Action] = []
         for repo in repos:
             if not self.accepts(repo):

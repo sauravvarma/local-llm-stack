@@ -57,6 +57,7 @@ class Repo:
     root: Path            # the model's directory (what tools load)
     files: list[ModelFile] = field(default_factory=list)
     revision: str = ""
+    quant_method: str = ""   # gptq | awq | ... ; "" when unquantised
 
     @property
     def publisher(self) -> str:
@@ -110,6 +111,25 @@ def splash_manifest(root: Path) -> dict | None:
     return None
 
 
+# Quantisations that live in safetensors but that only server-class runtimes
+# load. mlx_lm cannot read these, so they must be distinguishable from plain
+# full-precision safetensors, which it can.
+SERVER_ONLY_QUANTS = {"gptq", "awq", "compressed-tensors", "bitsandbytes", "fp8", "marlin"}
+
+
+def quant_method(root: Path) -> str:
+    """The `quantization_config.quant_method` a HF config advertises, lowercased.
+
+    Empty when the model is not quantised, or says nothing about how."""
+    cfg = _read_config(root) or {}
+    qc = cfg.get("quantization_config")
+    if isinstance(qc, dict):
+        method = qc.get("quant_method") or qc.get("quantization_method")
+        if isinstance(method, str):
+            return method.strip().lower()
+    return ""
+
+
 def classify(repo_id: str, root: Path, files: list[ModelFile]) -> str:
     if any(f.is_gguf for f in files):
         return "gguf"
@@ -135,10 +155,18 @@ def classify(repo_id: str, root: Path, files: list[ModelFile]) -> str:
 # ---------------------------------------------------------------- store scanners
 
 
+def _is_hidden(rel: Path) -> bool:
+    """True if any path SEGMENT is hidden. Checking only the filename misses
+    `hf download`'s scratch (`.cache/huggingface/download/x.bin.metadata`),
+    whose own names are not dotted, which used to roughly double a repo's
+    file count."""
+    return any(part.startswith(".") for part in rel.parts)
+
+
 def _collect_files(repo_id: str, root: Path) -> list[ModelFile]:
     out: list[ModelFile] = []
     for p in sorted(root.rglob("*")):
-        if p.is_dir() or p.name in SKIP_NAMES or p.name.startswith("."):
+        if p.is_dir() or p.name in SKIP_NAMES or _is_hidden(p.relative_to(root)):
             continue
         if p.suffix.lower() in SKIP_SUFFIXES:
             continue
@@ -190,7 +218,8 @@ def scan_flat(root: Path, label: str = "flat") -> list[Repo]:
 def _add_flat(repos: list[Repo], repo_id: str, root: Path, label: str) -> None:
     files = _collect_files(repo_id, root)
     if files:
-        repos.append(Repo(repo_id, classify(repo_id, root, files), label, root, files))
+        repos.append(Repo(repo_id, classify(repo_id, root, files), label, root, files,
+                          quant_method=quant_method(root)))
 
 
 def _current_revision(repo_dir: Path) -> str | None:
@@ -220,7 +249,8 @@ def scan_hf_cache(hub: Path, label: str = "hf-cache") -> list[Repo]:
         repo_id = repo_dir.name[len("models--"):].replace("--", "/")
         files = _collect_files(repo_id, snap)
         if files:
-            repos.append(Repo(repo_id, classify(repo_id, snap, files), label, snap, files, rev))
+            repos.append(Repo(repo_id, classify(repo_id, snap, files), label, snap, files, rev,
+                              quant_method=quant_method(snap)))
     return repos
 
 

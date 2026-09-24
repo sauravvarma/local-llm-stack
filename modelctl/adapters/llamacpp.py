@@ -19,9 +19,11 @@ class LlamaCppAdapter(Adapter):
     def accepts(self, repo: Repo) -> bool:
         return repo.fmt == "gguf"
 
-    def sync(self, repos: list[Repo], *, dry_run: bool = False) -> list[Action]:
+    def sync(self, repos: list[Repo], *, dry_run: bool = False, **options) -> list[Action]:
         return [
-            Action(self.name, "native", f.path.name, f"llama-server -m {f.path}")
+            # f.path is resolved, so in the HF cache it is blobs/<sha>: show the
+            # repo-relative name instead or the target column is a bare hash.
+            Action(self.name, "native", f.basename, f"llama-server -m {f.path}")
             for r in repos if self.accepts(r) for f in r.gguf_files
         ]
 

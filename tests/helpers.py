@@ -72,6 +72,15 @@ def make_flat_store(root: Path) -> Path:
     write_config(decoy / "config.json", {"model_type": "llama"})
     write_config(decoy / "manifest.json", {"name": "some-npm-thing", "version": "1.0.0"})
 
+    # GPTQ safetensors: vLLM can load it, mlx_lm cannot. Same container as a
+    # full-precision model, so only quantization_config tells them apart.
+    gptq = root / "TheBloke" / "Demo-GPTQ"
+    write(gptq / "model.safetensors")
+    write_config(gptq / "config.json", {
+        "model_type": "llama",
+        "quantization_config": {"quant_method": "gptq", "bits": 4},
+    })
+
     # bare model dir (no publisher level): files directly under a top-level dir
     bare = root / "BareModel"
     write(bare / "model.safetensors")
@@ -114,6 +123,7 @@ FLAT_FORMATS = {
     "incoai/Demo-Splash": "splash",
     "someone/Not-Splash": "safetensors",
     "Qwen/Qwen3-7B": "safetensors",
+    "TheBloke/Demo-GPTQ": "safetensors",
     "BareModel": "safetensors",
 }
 

@@ -64,11 +64,16 @@ class LMStudioFamilyAdapter(Adapter):
     def accepts(self, repo: Repo) -> bool:
         return repo.fmt in ("gguf", "mlx", "splash")
 
-    def sync(self, repos: list[Repo], *, dry_run: bool = False) -> list[Action]:
+    def sync(self, repos: list[Repo], *, dry_run: bool = False, **options) -> list[Action]:
         actions: list[Action] = []
         for repo in repos:
             if not self.accepts(repo):
                 continue
+            # A bare model (no publisher in its repo id) yields publisher ==
+            # model, so it projects to <dir>/<name>/<name>. These apps index a
+            # two-level tree and a bare model has no publisher to use, so the
+            # name is repeated deliberately; `modelctl adopt` is the way to give
+            # it a real publisher.
             target = self.models_dir / repo.publisher / repo.model
             if repo.fmt == "gguf":
                 for f in repo.gguf_files:

@@ -2,4 +2,8 @@
 # Thin launcher so `modelctl` works from anywhere without installing the package.
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec env PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -m modelctl "$@"
+# Prefer the project's own interpreter: pyproject declares >=3.13, while the
+# system python3 may be much older, so `python3` would test a runtime nobody ships.
+PY_BIN="$DIR/.venv/bin/python"
+[ -x "$PY_BIN" ] || PY_BIN="python3"
+exec env PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}" "$PY_BIN" -m modelctl "$@"

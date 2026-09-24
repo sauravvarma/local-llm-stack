@@ -75,26 +75,78 @@ How each tool is served:
   manifest rather than by a file extension. It loads nowhere else: vLLM and
   mlx_lm are explicitly excluded, even though the `.bin` shards would otherwise
   look like generic weights.
-- **llama.cpp** — `modelctl resolve <repo>` → path for `-m`, plus a flat symlink
-  library at `~/models/gguf/`.
+- **llama.cpp**: reads a GGUF by path, so nothing is projected.
+  `modelctl resolve <repo>` prints the path for `-m`.
 - **Ollama** — the outlier: its content-addressed blob store can't symlink, so
   reuse means *importing* (copying) via a Modelfile. Opt-in only.
 
 ## Usage
 
 ```sh
-bin/modelctl list -f                      # everything across all stores
-bin/modelctl sync                         # project the store into every tool
-bin/modelctl sync -n                      # dry run
-bin/modelctl resolve <repo> [file]        # path to load (dir for mlx/safetensors, file for gguf)
-bin/modelctl download <repo> [file …]     # hf download into models/<pub>/<model>, then sync
-bin/modelctl doctor                       # stores + per-tool checks
-bin/modelctl env                          # shell exports
+# look at things
+bin/modelctl list                       # every model, with incomplete ones flagged
+bin/modelctl list -f                    # also list each file
+bin/modelctl status                     # partial / stalled / interrupted downloads
+bin/modelctl verify <repo>              # check files against the Hub's checksums
+bin/modelctl resolve <repo> [file]      # the path to hand a tool
+bin/modelctl doctor                     # stores, downloads, per-tool checks
 
-# Ollama copies, so it's explicit:
-bin/modelctl sync --import-ollama
-bin/modelctl ollama-import <repo> [file] --name name:tag
+# change things
+bin/modelctl download <repo>            # pick a quant interactively, fetch, sync
+bin/modelctl download <repo> -n         # list the repo's variants, fetch nothing
+bin/modelctl download <repo> --include '*Q4_K_M*'
+bin/modelctl sync                       # project the store into every tool
+bin/modelctl sync -n                    # dry run
+bin/modelctl adopt <model> --publisher <name>   # MOVES into <pub>/<model> layout
+bin/modelctl ollama-import <repo>       # opt-in, COPIES bytes
+
+# set things up
+bin/modelctl env                        # shell exports
 ```
+
+Every command has `--help` with its own options and examples.
+
+### Picking a quant
+
+A GGUF repo is usually one model at a dozen-plus quantisations:
+`unsloth/Qwen3.8-27B-GGUF` is 33 files and **472 GB** if you take the default.
+So `download` lists what the repo actually publishes and asks:
+
+```
+unsloth/Qwen3.8-27B-GGUF publishes 25 quantisations.
+Select what to download:
+
+   [ ] UD-IQ2_XXS                           7.3G
+ › [x] UD-Q4_K_M                            16.5G
+   [ ] UD-Q6_K_XL                           25.3G
+   [x] mmproj-F16  (vision projector)      927.6M
+    … 22 more below
+
+  2 selected, 17.4G
+  ↑/↓ move   space toggle   a all   n none   enter confirm   q cancel
+```
+
+Variants that are not quants are classified separately, because picking
+`mmproj-F16` thinking it is "the F16 quant" would fetch a 900 MB projector
+instead of a model. Pass filenames, `--include` or `--all` to skip the prompt.
+With no terminal, `download` refuses rather than silently fetching everything.
+
+### Interrupted downloads
+
+Downloads here usually die because a laptop lid closed or the network moved,
+not because anything crashed: `hf` sits on a dead socket, the partial bytes
+stay on disk, and the model looks present but cannot load. `status` names that:
+
+```
+$ modelctl status
+unsloth/Qwen3.8-27B-GGUF
+    interrupted: 3 file(s) partial, 1.2G already fetched, idle 4h12m
+    -> nothing is running; `modelctl download <repo>` resumes from the partial bytes
+```
+
+`downloading` and `stalled` mean a process still owns it (kill it first);
+`interrupted` means nothing does. Re-running the download resumes either way.
+
 
 ## Configuration (env vars, all optional)
 
@@ -105,7 +157,6 @@ bin/modelctl ollama-import <repo> [file] --name name:tag
 | `HF_HOME` / `HF_HUB_CACHE` | `~/.cache/huggingface` | HF cache location |
 | `MODELCTL_LMSTUDIO_DIR` | `~/.lmstudio/models` | LM Studio's models root |
 | `MODELCTL_BIONIC_DIR` | Bionic's `downloadsFolder` | Bionic's models root (overrides its settings) |
-| `MODELCTL_GGUF_DIR` | `~/models/gguf` | flat GGUF library for llama.cpp |
 
 > The `models/` folder is gitignored (large binaries, never committed) and so
 > lives only in your primary checkout — Conductor worktrees won't have it. Point

@@ -20,7 +20,7 @@ class VllmAdapter(Adapter):
     def accepts(self, repo: Repo) -> bool:
         return repo.fmt == "safetensors"
 
-    def sync(self, repos: list[Repo], *, dry_run: bool = False) -> list[Action]:
+    def sync(self, repos: list[Repo], *, dry_run: bool = False, **options) -> list[Action]:
         return [
             Action(self.name, "native", r.repo_id, f"vllm serve {r.root}")
             for r in repos if self.accepts(r)

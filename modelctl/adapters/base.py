@@ -6,6 +6,10 @@ The contract is deliberately tiny:
     accepts(repo)            -> is this repo relevant to my tool?
     sync(repos, dry_run)     -> make my tool's view match the cache (idempotent)
     doctor()                 -> human-readable config/env checks
+
+`sync` takes **options so an adapter can accept a flag (ollama's opt-in
+import) without the CLI growing a branch per adapter. Adapters ignore options
+they do not recognise.
 """
 
 from __future__ import annotations
@@ -39,7 +43,7 @@ class Adapter:
     def accepts(self, repo: Repo) -> bool:
         return False
 
-    def sync(self, repos: list[Repo], *, dry_run: bool = False) -> list[Action]:
+    def sync(self, repos: list[Repo], *, dry_run: bool = False, **options) -> list[Action]:
         return []
 
     def doctor(self) -> list[str]:
