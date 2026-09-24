@@ -80,6 +80,25 @@ How each tool is served:
 - **Ollama** — the outlier: its content-addressed blob store can't symlink, so
   reuse means *importing* (copying) via a Modelfile. Opt-in only.
 
+## Requirements
+
+Python 3.14 (what `.python-version` pins and what `bin/` runs), plus the
+`hf` CLI for `download` and `verify`:
+
+```sh
+uv python install 3.14 && uv venv --python 3.14
+uv tool install huggingface-hub          # provides `hf`
+```
+
+modelctl itself imports nothing outside the standard library. The suite is
+verified on 3.9.6, 3.11.15, 3.12.13, 3.13.13 and 3.14.5, so the declared floor
+of 3.9 is measured rather than assumed; 3.14 is simply the newest stable that
+every piece accepts (`hf` needs >=3.10, and 3.15 is still a beta).
+
+`bin/modelctl` and `bin/test` prefer `.venv/bin/python` and fall back to
+`python3`, so they do not silently run on whatever the system ships (on macOS
+that is still 3.9).
+
 ## Usage
 
 ```sh
