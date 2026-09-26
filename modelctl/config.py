@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .adapters.bionic import BionicDir, models_dir as bionic_models_dir
+from .adapters.omlx import OmlxDirs, model_dirs as omlx_model_dirs
 from .cache import Repo, hub_dir, scan_flat, scan_hf_cache
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +36,7 @@ class Config:
     scan_hub: bool
     lmstudio_dir: Path
     bionic: BionicDir           # Bionic's models dir + how it was resolved
+    omlx: OmlxDirs              # oMLX's model dirs (scan order) + provenance
 
     @classmethod
     def load(cls) -> "Config":
@@ -51,6 +53,7 @@ class Config:
             # Bionic keeps its own downloadsFolder (default ~/.lmstudio/models),
             # so it usually needs a real projection. Override: MODELCTL_BIONIC_DIR.
             bionic=bionic_models_dir(),
+            omlx=omlx_model_dirs(),
         )
 
     def scan(self) -> list[Repo]:

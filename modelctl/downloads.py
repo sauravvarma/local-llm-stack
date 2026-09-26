@@ -7,8 +7,14 @@ A `--local-dir` download leaves its bookkeeping beside the files, under
     <relpath>.lock        held while a file is being fetched
     <opaque>.incomplete   the partial bytes of a file still arriving
 
-So a model with any `.incomplete` file is not whole, and the set of them says
-exactly what is missing. That is worth surfacing, because the usual way a
+A model is incomplete when some `.incomplete` file has no finished twin. The
+twin check matters: hf 2.0 names temp files `<path-hash>=.<etag>.<random>`, and
+the random suffix means every retry starts a FRESH temp file rather than
+resuming the old one. When a later attempt finishes, hf renames its own temp
+file and abandons the losers. So after a flaky download a complete model can
+carry dozens of stale `.incomplete` files, and "a temp file exists" does not
+mean "a file is missing". An `.incomplete` is only pending if its etag does not
+appear in any completed `.metadata` (whose second line is the etag). That is worth surfacing, because the usual way a
 download dies here is not a crash: the laptop lid closes, or the network moves
 from wifi to tethering, and `hf` sits on a dead socket. Nothing fails loudly,
 the directory keeps its partial bytes, and `modelctl list` would happily report
@@ -48,7 +54,8 @@ class DownloadState:
     """What the scratch directory says about one model."""
 
     root: Path
-    incomplete: list[Path] = field(default_factory=list)
+    incomplete: list[Path] = field(default_factory=list)   # genuinely pending
+    stale: list[Path] = field(default_factory=list)        # retry leftovers, safe to delete
     completed: int = 0
     active: bool = False          # a live `hf download` owns this directory
     now: float = field(default_factory=time.time)
@@ -105,8 +112,15 @@ class DownloadState:
                            "from the partial bytes",
         }[self.status]
 
+    @property
+    def stale_bytes(self) -> int:
+        return sum(_size(p) for p in self.stale)
+
     def summary(self) -> str:
         if not self.partial:
+            if self.stale:
+                return (f"complete ({len(self.stale)} stale temp file(s) from retries, "
+                        f"{human_duration_bytes(self.stale_bytes)} reclaimable)")
             return "complete"
         bits = [f"{len(self.incomplete)} file(s) partial"]
         if self.pending_bytes:
@@ -115,6 +129,35 @@ class DownloadState:
         if idle is not None:
             bits.append(f"idle {human_duration(idle)}")
         return f"{self.status}: " + ", ".join(bits)
+
+
+def _size(p: Path) -> int:
+    try:
+        return p.stat().st_size
+    except OSError:
+        return 0
+
+
+def _etag_of_incomplete(name: str) -> str | None:
+    """The etag embedded in a temp file's name.
+
+    hf 1.x: `<path-hash>=.<etag>.incomplete`; hf 2.x adds a per-attempt
+    suffix: `<path-hash>=.<etag>.<random>.incomplete`. Either way it is the
+    second dot-separated field. None if the name fits neither shape."""
+    parts = name.split(".")
+    return parts[1] if len(parts) >= 3 and parts[1] else None
+
+
+def _completed_etags(metadata: list[Path]) -> set[str]:
+    etags: set[str] = set()
+    for m in metadata:
+        try:
+            lines = m.read_text().splitlines()
+        except OSError:
+            continue
+        if len(lines) >= 2 and lines[1].strip():
+            etags.add(lines[1].strip())
+    return etags
 
 
 def human_duration(seconds: float) -> str:
@@ -169,25 +212,31 @@ def inspect(root: Path, *, active_dirs: set[str] | None = None) -> DownloadState
     """Read one model directory's download state. Never raises on a missing or
     unreadable scratch dir: no scratch simply means nothing is pending."""
     scratch = scratch_dir(root)
-    incomplete: list[Path] = []
-    completed = 0
+    temps: list[Path] = []
+    metadata: list[Path] = []
     if scratch.is_dir():
         try:
             for p in scratch.rglob("*"):
                 if not p.is_file():
                     continue
                 if p.name.endswith(INCOMPLETE_SUFFIX):
-                    incomplete.append(p)
+                    temps.append(p)
                 elif p.name.endswith(METADATA_SUFFIX):
-                    completed += 1
+                    metadata.append(p)
         except OSError:
             pass
+    done = _completed_etags(metadata)
+    incomplete, stale = [], []
+    for p in temps:
+        etag = _etag_of_incomplete(p.name)
+        (stale if etag is not None and etag in done else incomplete).append(p)
+    completed = len(metadata)
     if active_dirs is None:
         active_dirs = active_download_dirs()
     # Normalise BOTH sides: a path may reach us with a trailing slash from a
     # command line or from a caller, and only one side was being stripped.
     active = str(root).rstrip("/") in {d.rstrip("/") for d in active_dirs}
-    return DownloadState(root=root, incomplete=sorted(incomplete),
+    return DownloadState(root=root, incomplete=sorted(incomplete), stale=sorted(stale),
                          completed=completed, active=active)
 
 

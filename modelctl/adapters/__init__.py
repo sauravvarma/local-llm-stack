@@ -8,6 +8,7 @@ from .lmstudio import LMStudioAdapter
 from .llamacpp import LlamaCppAdapter
 from .mlx import MlxAdapter
 from .ollama import OllamaAdapter
+from .omlx import OmlxAdapter
 from .splash import SplashAdapter
 from .vllm import VllmAdapter
 
@@ -19,6 +20,7 @@ def build_adapters(cfg: "Config") -> dict[str, Adapter]:
     return {
         "vllm": VllmAdapter(),
         "mlx": MlxAdapter(),
+        "omlx": OmlxAdapter(cfg.omlx),
         "lmstudio": LMStudioAdapter(cfg.lmstudio_dir),
         "bionic": BionicAdapter(cfg.bionic),
         "splash": SplashAdapter(),

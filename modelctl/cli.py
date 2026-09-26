@@ -18,7 +18,7 @@ One model store, projected into every local LLM tool.
 
 Models are downloaded once into a single store. Tools that read a path
 (llama.cpp, mlx_lm, vLLM, Splash) are pointed at it; tools that want their own
-directory (LM Studio, Bionic) get a symlink or hard-link projection, so the
+directory (LM Studio, Bionic, oMLX) get a symlink or hard-link projection, so the
 bytes are never copied. `modelctl sync` makes every tool's view match the
 store, and is safe to re-run.
 """
@@ -173,6 +173,7 @@ def cmd_env(cfg: Config, args) -> int:
     print("\n# Where each app-managed tool keeps its models (override if you move them):")
     print(f"export MODELCTL_LMSTUDIO_DIR={cfg.lmstudio_dir}")
     print(f"export MODELCTL_BIONIC_DIR={cfg.bionic.path}")
+    print(f"export MODELCTL_OMLX_DIR={cfg.omlx.dirs[0]}")
     return 0
 
 
@@ -507,7 +508,7 @@ def build_parser() -> argparse.ArgumentParser:
                "  modelctl sync -a bionic     # one adapter only\n")
     sp.add_argument("-a", "--adapter", action="append", metavar="NAME",
                     help="limit to these adapters; repeatable "
-                         "(vllm, mlx, lmstudio, bionic, splash, llamacpp, ollama)")
+                         "(vllm, mlx, omlx, lmstudio, bionic, splash, llamacpp, ollama)")
     sp.add_argument("-n", "--dry-run", action="store_true",
                     help="show what would change without touching the filesystem")
     sp.add_argument("--import-ollama", action="store_true",

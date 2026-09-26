@@ -22,12 +22,16 @@ models/
 
 Each model is classified from its files/`config.json`; adapters accept by capability.
 
-| format | how detected | vLLM | mlx_lm | splash | LM Studio / Bionic | llama.cpp | ollama |
-|--------|--------------|:----:|:------:|:------:|:------------------:|:---------:|:------:|
-| **gguf** | `*.gguf` | – | – | – | ✓ symlink | ✓ symlink | ✓ *copy* |
-| **mlx** | top-level `quantization` in config / name `*MLX*` | – | ✓ path | – | ✓ dir symlink | – | – |
-| **splash** | root `manifest.json` with `format.name` + `artifacts` | – | – | ✓ path | ✓ hard link¹ | – | – |
-| **safetensors** | `*.safetensors` + `config.json` (full / GPTQ / AWQ) | ✓ path | ✓ path | – | – | – | – |
+| format | how detected | vLLM | mlx_lm | oMLX | splash | LM Studio / Bionic | llama.cpp | ollama |
+|--------|--------------|:----:|:------:|:----:|:------:|:------------------:|:---------:|:------:|
+| **gguf** | `*.gguf` | – | – | – | – | ✓ symlink | ✓ symlink | ✓ *copy* |
+| **mlx** | top-level `quantization` in config / name `*MLX*` | – | ✓ path | ✓ dir symlink | – | ✓ dir symlink | – | – |
+| **splash** | root `manifest.json` with `format.name` + `artifacts` | – | – | – | ✓ path | ✓ hard link¹ | – | – |
+| **safetensors** | `*.safetensors` + `config.json` (full / GPTQ / AWQ) | ✓ path | ✓ path² | ✓ dir symlink² | – | – | – | – |
+
+² Full-precision only. GPTQ, AWQ and other server-class quantisations are
+safetensors too, but neither mlx_lm nor oMLX can load them, so modelctl reads
+`quantization_config.quant_method` and keeps them for vLLM.
 
 ¹ Splash is the one format the LM Studio family cannot reach by symlink. Its
 indexer resolves real paths and enforces containment twice, so `sync` mirrors
@@ -68,6 +72,15 @@ How each tool is served:
   so in practice an app serves splash only when its models dir is the store.
   That's true of LM Studio here and not of Bionic, whose `downloadsFolder`
   defaults to `<home>/models`.
+- **oMLX**: an MLX inference server for Apple silicon. It scans each of its
+  model directories two levels deep (`<dir>/<model>` or `<dir>/<org>/<model>`,
+  keyed on `config.json`) and follows symlinks, so the store's layout projects
+  as directory symlinks into its primary model dir. Its `model.model_dirs` is a
+  list, so adding the store to it makes sync a no-op; modelctl never edits
+  oMLX's settings itself, since that file holds its API keys. Two quirks it
+  handles: oMLX names a model by folder alone, so two publishers' `Foo-4bit`
+  would shadow each other (reported, not linked), and it discovers models only
+  at startup, so sync prints the restart it needs.
 - **Splash** (`splash`): Inco AI's Apple-silicon engine. Reads the package
   directory directly, so no projection: `splash serve --model <path>`. A splash
   package is `manifest.json` + `target/` + `draft/` + `vision/` + `tokenizer/`,
@@ -176,6 +189,7 @@ unsloth/Qwen3.8-27B-GGUF
 | `HF_HOME` / `HF_HUB_CACHE` | `~/.cache/huggingface` | HF cache location |
 | `MODELCTL_LMSTUDIO_DIR` | `~/.lmstudio/models` | LM Studio's models root |
 | `MODELCTL_BIONIC_DIR` | Bionic's `downloadsFolder` | Bionic's models root (overrides its settings) |
+| `MODELCTL_OMLX_DIR` | oMLX's first `model_dirs` entry | where modelctl projects for oMLX (also honours `OMLX_BASE_PATH`, `OMLX_MODEL_DIR`) |
 
 > The `models/` folder is gitignored (large binaries, never committed) and so
 > lives only in your primary checkout — Conductor worktrees won't have it. Point

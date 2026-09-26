@@ -132,7 +132,8 @@ class EnvTestCase(unittest.TestCase):
     """Snapshot/restore the env vars modelctl reads, so tests don't leak."""
 
     ENV_KEYS = ("MODELCTL_STORE", "MODELCTL_SCAN_HUB", "MODELCTL_LMSTUDIO_DIR",
-                "MODELCTL_BIONIC_DIR", "HF_HOME", "HF_HUB_CACHE")
+                "MODELCTL_BIONIC_DIR", "MODELCTL_OMLX_DIR", "OMLX_BASE_PATH",
+                "OMLX_MODEL_DIR", "HF_HOME", "HF_HUB_CACHE")
 
     def setUp(self):
         self._saved = {k: os.environ.get(k) for k in self.ENV_KEYS}

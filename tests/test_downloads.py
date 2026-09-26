@@ -79,6 +79,63 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(st.status, "complete")
 
 
+class StaleTempFileTest(unittest.TestCase):
+    """hf 2.0 starts a fresh temp file per retry and abandons the losers when
+    one attempt finishes, so temp files can outlive a COMPLETE model. Found in
+    the wild: a verified-complete 68GB model reported as interrupted."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.model = Path(self.tmp.name) / "pub" / "model"
+        self.scr = downloads.scratch_dir(self.model)
+        self.scr.mkdir(parents=True)
+
+    def done(self, name, etag):
+        (self.scr / f"{name}.metadata").write_text(f"commit\n{etag}\n1790000000.0\n")
+
+    def temp(self, name, size=100):
+        p = self.scr / name
+        p.write_bytes(b"x" * size)
+        return p
+
+    def test_leftover_from_a_finished_file_is_stale_not_partial(self):
+        self.done("model-00001.safetensors", "aaa111")
+        self.temp("hashA=.aaa111.1f2e3d4c.incomplete")        # hf 2.x naming
+        self.temp("hashA=.aaa111.9a8b7c6d.incomplete", size=0)
+        st = downloads.inspect(self.model, active_dirs=set())
+        self.assertEqual(st.status, "complete")
+        self.assertEqual(len(st.stale), 2)
+        self.assertIn("stale", st.summary())
+        self.assertIn("reclaimable", st.summary())
+
+    def test_temp_for_an_unfinished_file_is_still_partial(self):
+        self.done("model-00001.safetensors", "aaa111")
+        self.temp("hashB=.bbb222.1f2e3d4c.incomplete")
+        st = downloads.inspect(self.model, active_dirs=set())
+        self.assertEqual(st.status, "interrupted")
+        self.assertEqual(len(st.incomplete), 1)
+
+    def test_hf1_naming_is_understood_too(self):
+        self.done("model.safetensors", "ccc333")
+        self.temp("hashC=.ccc333.incomplete")                 # hf 1.x naming
+        self.assertEqual(downloads.inspect(self.model, active_dirs=set()).status, "complete")
+
+    def test_unparseable_temp_name_counts_as_pending(self):
+        """When in doubt, say incomplete: a false alarm costs a re-run, a false
+        all-clear costs a model that will not load."""
+        self.temp("weird.incomplete")
+        self.assertEqual(downloads.inspect(self.model, active_dirs=set()).status, "interrupted")
+
+    def test_mixed_stale_and_live(self):
+        self.done("a.safetensors", "aaa111")
+        self.temp("h1=.aaa111.x1.incomplete")
+        self.temp("h2=.bbb222.x2.incomplete")
+        st = downloads.inspect(self.model, active_dirs=set())
+        self.assertEqual((len(st.incomplete), len(st.stale)), (1, 1))
+        self.assertTrue(st.partial)
+
+
 class ScanStoreTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
