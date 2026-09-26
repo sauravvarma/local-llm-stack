@@ -47,9 +47,9 @@ against Bionic 1.1.5:
 A hard link has no separate real path, so both checks pass, and sharing inodes
 means the mirror costs nothing (17.4 GB mirrored with no change in free space).
 It needs one filesystem: across filesystems `sync` skips with an explanation.
-Because inodes are shared, deleting the package from the store does not reclaim
-space until the mirror goes too, and a re-download (new inode) is repaired by
-inode comparison on the next sync.
+Because inodes are shared, deleting the package from the store frees nothing
+until the mirror goes too; the next `sync` removes it (see *What sync removes*).
+A re-download (new inode) is repaired by inode comparison on the next sync.
 
 How each tool is served:
 
@@ -138,6 +138,33 @@ bin/modelctl env                        # shell exports
 
 Every command has `--help` with its own options and examples.
 
+### What sync removes
+
+`sync` makes each tool's view *match* the store, so it also takes away what the
+store no longer has: projections of deleted models, and of models it no longer
+projects (an MLX or Splash model whose download is incomplete, or one shadowed
+by a name clash in oMLX). It shows each removal as `-`:
+
+```
+- [bionic] ~/.lmstudio/models/mlx-community/gemma-4-12B-it-8bit  (target no longer in the store)
+```
+
+It only removes what it can prove it made, in folders other apps own:
+
+- **symlinks whose target lies inside a store or the HF cache.** Ownership is
+  readable from the link itself, so no state is needed, and this also cleans
+  up links made before pruning existed. Links pointing anywhere else are left.
+- **hard-link mirrors recorded in `<store>/.modelctl/mirrors.json`.** Once the
+  store copy is deleted a mirror is just a real directory, indistinguishable
+  from a model the app downloaded itself, so only recorded files are deleted,
+  and anything else found inside is kept. A mirror is recorded whenever sync
+  makes or confirms it (confirming means its inodes still match the store,
+  which proves ownership), so older mirrors get recorded on the next sync.
+
+It never deletes a real file it did not record, and never prunes inside a
+store: when an app's models folder *is* the store (LM Studio pointed at it),
+its links belong to you. `sync --no-prune` only adds and repairs.
+
 ### Picking a quant
 
 A GGUF repo is usually one model at a dozen-plus quantisations:
@@ -178,6 +205,17 @@ unsloth/Qwen3.8-27B-GGUF
 
 `downloading` and `stalled` mean a process still owns it (kill it first);
 `interrupted` means nothing does. Re-running the download resumes either way.
+
+A flaky download can also leave debris behind a model that is actually whole:
+hf 2.0 starts a fresh temp file per retry and abandons the losers when one
+attempt finishes. `status` tells those apart by matching each temp file's etag
+against the files that completed, and reports them as reclaimable rather than
+calling the model incomplete:
+
+```
+sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit
+    complete (24 stale temp file(s) from retries, 1.9G reclaimable)
+```
 
 
 ## Configuration (env vars, all optional)

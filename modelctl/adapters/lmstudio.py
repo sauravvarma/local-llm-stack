@@ -25,7 +25,9 @@ symlinks happily.
 Two consequences worth knowing. A re-download replaces a file with a NEW inode,
 orphaning the mirror, so the tree is kept fresh by comparing inodes and
 relinking what drifted. And because inodes are shared, deleting the package
-from the store does not reclaim space until this mirror goes too.
+from the store frees nothing until this mirror goes too, which is why every
+mirror is recorded in a ledger: the next sync removes it once its source is
+gone (see base.MirrorLedger).
 
 When the package already resolves inside `models_dir` (the app's models dir IS
 the store) nothing is needed, and a nested store can still use a plain
@@ -40,7 +42,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..cache import Repo
-from .base import Action, Adapter, ensure_hardlink_tree, ensure_symlink
+from .. import downloads
+from .base import (Action, Adapter, MirrorLedger, ensure_hardlink_tree,
+                   ensure_symlink, prune_links)
 
 
 def _resolves_within(child: Path, parent: Path) -> bool:
@@ -65,7 +69,12 @@ class LMStudioFamilyAdapter(Adapter):
         return repo.fmt in ("gguf", "mlx", "splash")
 
     def sync(self, repos: list[Repo], *, dry_run: bool = False, **options) -> list[Action]:
+        """Project every accepted repo, then (with prune=True) remove what the
+        store no longer has. Options: prune, sources, protected, state_dir."""
+        state_dir = options.get("state_dir")
+        ledger = MirrorLedger(Path(state_dir) / "mirrors.json" if state_dir else None)
         actions: list[Action] = []
+        desired: set[Path] = set()      # every path this sync wants to exist
         for repo in repos:
             if not self.accepts(repo):
                 continue
@@ -76,16 +85,36 @@ class LMStudioFamilyAdapter(Adapter):
             # it a real publisher.
             target = self.models_dir / repo.publisher / repo.model
             if repo.fmt == "gguf":
+                # Per-file links are safe even mid-download: hf writes partial
+                # bytes to temp files and renames on completion, so a .gguf at
+                # its final path is always whole.
                 for f in repo.gguf_files:
+                    desired.add(target / f.filename)
                     actions.append(ensure_symlink(
                         target / f.filename, f.path, self.name, dry_run=dry_run))
-            elif repo.fmt == "splash" and not _resolves_within(repo.root, self.models_dir):
+                continue
+            # A directory-level projection exposes the whole model, so a
+            # partial one would show up and then fail to load.
+            if downloads.inspect(repo.root, active_dirs=set()).partial:
+                actions.append(Action(self.name, "skip", str(target),
+                                      "incomplete download; not projected until it finishes "
+                                      "(see `modelctl status`)"))
+                continue
+            desired.add(target)
+            if repo.fmt == "splash" and not _resolves_within(repo.root, self.models_dir):
                 # Symlinks are rejected at both levels, so mirror the package
                 # with hard links instead: same inodes, no extra bytes.
                 actions.append(ensure_hardlink_tree(
-                    target, repo.root, self.name, dry_run=dry_run))
+                    target, repo.root, self.name, dry_run=dry_run, ledger=ledger))
             else:  # mlx, or splash already inside the models dir: link the directory
                 actions.append(ensure_symlink(target, repo.root, self.name, dry_run=dry_run))
+        if options.get("prune"):
+            actions += prune_links(self.models_dir, desired,
+                                   sources=list(options.get("sources", [])),
+                                   protected=list(options.get("protected", [])),
+                                   adapter=self.name, dry_run=dry_run)
+            actions += ledger.prune(self.name, self.models_dir, desired, dry_run=dry_run)
+        ledger.save(dry_run=dry_run)
         return actions
 
     def doctor(self) -> list[str]:

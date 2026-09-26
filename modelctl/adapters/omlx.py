@@ -44,7 +44,7 @@ from typing import NamedTuple
 
 from .. import downloads
 from ..cache import SERVER_ONLY_QUANTS, Repo
-from .base import Action, Adapter, ensure_symlink
+from .base import Action, Adapter, ensure_symlink, prune_links
 
 
 def _bootstrap_file() -> Path:
@@ -145,6 +145,7 @@ class OmlxAdapter(Adapter):
     def sync(self, repos: list[Repo], *, dry_run: bool = False, **options) -> list[Action]:
         actions: list[Action] = []
         claimed: dict[str, str] = {}     # folder name -> repo_id that owns it in oMLX
+        desired: set[Path] = set()       # every link this sync wants to exist
         changed = False
         for repo in repos:
             if not self.accepts(repo):
@@ -172,9 +173,17 @@ class OmlxAdapter(Adapter):
                     "incomplete download; not projected until it finishes "
                     "(see `modelctl status`)"))
                 continue
+            desired.add(target)
             action = ensure_symlink(target, repo.root, self.name, dry_run=dry_run)
             changed = changed or action.op in ("link", "relink")
             actions.append(action)
+        if options.get("prune"):
+            for d in self.where.dirs:
+                pruned = prune_links(d, desired, sources=list(options.get("sources", [])),
+                                     protected=list(options.get("protected", [])),
+                                     adapter=self.name, dry_run=dry_run)
+                changed = changed or bool(pruned)
+                actions += pruned
         if changed:
             actions.append(Action(
                 self.name, "native", "oMLX server",

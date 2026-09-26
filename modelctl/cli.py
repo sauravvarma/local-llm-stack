@@ -302,7 +302,8 @@ def cmd_download(cfg: Config, args) -> int:
         return rc
     if not args.no_sync:
         print()
-        return cmd_sync(cfg, argparse.Namespace(adapter=None, dry_run=False, import_ollama=False))
+        return cmd_sync(cfg, argparse.Namespace(adapter=None, dry_run=False,
+                                                import_ollama=False, no_prune=False))
     return 0
 
 
@@ -324,10 +325,19 @@ def cmd_sync(cfg: Config, args) -> int:
     repos = cfg.scan()
     adapters = _selected(cfg, args.adapter)
     print(f"{'DRY RUN - ' if args.dry_run else ''}syncing {len(repos)} model(s)\n")
+    # Everything modelctl projects FROM. A link pointing into one of these was
+    # made by modelctl; the stores themselves are never pruned inside.
+    stores = [cfg.store, *cfg.extra_stores]
+    sources = stores + ([cfg.hub] if cfg.scan_hub else [])
+    options = dict(
+        import_ollama=getattr(args, "import_ollama", False),
+        prune=not getattr(args, "no_prune", False),
+        sources=sources, protected=sources,
+        state_dir=cfg.store / ".modelctl",
+    )
     total = 0
     for name, adapter in adapters.items():
-        for a in adapter.sync(repos, dry_run=args.dry_run,
-                              import_ollama=getattr(args, "import_ollama", False)):
+        for a in adapter.sync(repos, dry_run=args.dry_run, **options):
             print(a)
             total += 1
     if total == 0:
@@ -498,11 +508,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "sync", help="project the store into every tool's view", formatter_class=_fmt,
-        description="Make each tool's view match the store. Idempotent, and it never\n"
-                    "overwrites a real file: a target that exists and is not a link is\n"
-                    "reported as an error and left alone.\n\n"
+        description="Make each tool's view MATCH the store: add what is new, repair what\n"
+                    "drifted, and remove projections of models the store no longer has.\n"
+                    "Idempotent. It only ever removes what it can prove it made (links\n"
+                    "pointing into the store, recorded hard-link mirrors), never a real\n"
+                    "file, and never anything inside a store.\n\n"
                     "  +  created a link      ~  repointed a stale link\n"
-                    "  .  already correct     =  nothing to do, here is the launch command\n"
+                    "  -  removed a link      .  already correct\n"
+                    "  =  nothing to do, here is the launch command\n"
                     "  C  copied bytes        !  refused, something real is in the way\n",
         epilog="examples:\n  modelctl sync\n  modelctl sync -n            # preview\n"
                "  modelctl sync -a bionic     # one adapter only\n")
@@ -513,6 +526,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="show what would change without touching the filesystem")
     sp.add_argument("--import-ollama", action="store_true",
                     help="also import GGUFs into ollama, which COPIES the bytes")
+    sp.add_argument("--no-prune", action="store_true",
+                    help="only add and repair; leave projections of deleted models in place")
     sp.set_defaults(func=cmd_sync)
 
     sp = sub.add_parser(
