@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -27,7 +29,7 @@ EPILOG = """\
 commands by what they do:
 
   look at things       list, resolve, status, verify, doctor
-  change things        download, sync, adopt, ollama-import
+  change things        download, sync, prune, adopt, ollama-import
   set things up        env
 
 typical session:
@@ -321,27 +323,205 @@ def _selected(cfg: Config, names):
     return {n: adapters[n] for n in names}
 
 
-def cmd_sync(cfg: Config, args) -> int:
-    repos = cfg.scan()
-    adapters = _selected(cfg, args.adapter)
-    print(f"{'DRY RUN - ' if args.dry_run else ''}syncing {len(repos)} model(s)\n")
+def _sync_actions(cfg: Config, repos, *, dry_run: bool, adapter_names=None,
+                  import_ollama: bool = False, prune: bool = True):
+    """Run every selected adapter over `repos` and return its actions.
+
+    Taking the repo list as an argument (rather than rescanning) is what lets
+    `prune` preview removals honestly: it syncs the store MINUS the models it
+    is about to delete, and the unlinks that produces are exactly the ones a
+    real run will make."""
     # Everything modelctl projects FROM. A link pointing into one of these was
     # made by modelctl; the stores themselves are never pruned inside.
     stores = [cfg.store, *cfg.extra_stores]
     sources = stores + ([cfg.hub] if cfg.scan_hub else [])
-    options = dict(
-        import_ollama=getattr(args, "import_ollama", False),
-        prune=not getattr(args, "no_prune", False),
-        sources=sources, protected=sources,
-        state_dir=cfg.store / ".modelctl",
-    )
-    total = 0
-    for name, adapter in adapters.items():
-        for a in adapter.sync(repos, dry_run=args.dry_run, **options):
-            print(a)
-            total += 1
-    if total == 0:
+    options = dict(import_ollama=import_ollama, prune=prune,
+                   sources=sources, protected=sources,
+                   state_dir=cfg.store / ".modelctl")
+    actions = []
+    for _, adapter in _selected(cfg, adapter_names).items():
+        actions += adapter.sync(repos, dry_run=dry_run, **options)
+    return actions
+
+
+def cmd_sync(cfg: Config, args) -> int:
+    repos = cfg.scan()
+    print(f"{'DRY RUN - ' if args.dry_run else ''}syncing {len(repos)} model(s)\n")
+    actions = _sync_actions(cfg, repos, dry_run=args.dry_run, adapter_names=args.adapter,
+                            import_ollama=getattr(args, "import_ollama", False),
+                            prune=not getattr(args, "no_prune", False))
+    for a in actions:
+        print(a)
+    if not actions:
         print("  (nothing to project)")
+    return 0
+
+
+# ----------------------------------------------------------------- prune
+
+
+def _confirm(question: str) -> bool:
+    print(f"{question} [y/N] ", end="", file=sys.stderr, flush=True)
+    try:
+        return input().strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def _prune_refusal(cfg: Config, repo, active: set[str]) -> str | None:
+    """Why this repo must not be deleted by prune, or None if it may be."""
+    if repo.store == "hf-cache":
+        return (f"lives in the HF cache, whose blobs can be shared between revisions; "
+                f"use `hf cache rm model/{repo.repo_id}`")
+    if repo.store != "store":        # Config.scan labels the primary store "store"
+        return "is in an extra store, which modelctl treats as read-only"
+    if not repo.root.is_symlink() and repo.root.resolve() == cfg.store.resolve():
+        return "resolves to the store itself"
+    if downloads.inspect(repo.root, active_dirs=active).active:
+        return "is being downloaded right now; stop that download first"
+    return None
+
+
+def _delete_model(root: Path, store: Path) -> None:
+    """Delete one model from the store.
+
+    A store entry that is itself a symlink (`adopt --link` makes these) is
+    removed as a link: its target lives elsewhere and is not ours to delete.
+    rmtree never follows symlinks inside the tree either. Then drop the
+    publisher folder if that left it empty."""
+    if root.is_symlink():
+        root.unlink()
+    else:
+        shutil.rmtree(root)
+    parent = root.parent
+    if parent != store and parent.is_dir() and not any(parent.iterdir()):
+        parent.rmdir()
+
+
+def _prune_stale(cfg: Config, *, dry_run: bool) -> tuple[int, int]:
+    """Delete temp files abandoned by retried downloads. Only files whose etag
+    matches a COMPLETED file are touched, so a live partial is never removed."""
+    count = size = 0
+    for state in downloads.scan_store(cfg.store):
+        for p in state.stale:
+            try:
+                size += p.stat().st_size
+                if not dry_run:
+                    p.unlink()
+                count += 1
+            except OSError:
+                pass
+    return count, size
+
+
+def _reclaimable(roots: list[Path]) -> int:
+    """Bytes that deleting every file under `roots` actually frees.
+
+    A file's data is freed only when its LAST hard link goes. A Splash model is
+    the case that matters: its store copy and Bionic mirror share inodes, so
+    the model's bytes come back only because prune removes both. Counting links
+    removed per inode against st_nlink gets that right, where "free space
+    before vs after" would also count whatever else wrote to the disk."""
+    inodes: dict[tuple[int, int], list[int]] = {}   # (dev, ino) -> [size, nlink, removed]
+    for root in roots:
+        if root.is_symlink() or not root.is_dir():
+            continue
+        for dirpath, _, files in os.walk(root, followlinks=False):
+            for name in files:
+                try:
+                    st = os.lstat(os.path.join(dirpath, name))
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                entry = inodes.setdefault((st.st_dev, st.st_ino), [st.st_size, st.st_nlink, 0])
+                entry[2] += 1
+    return sum(size for size, nlink, removed in inodes.values() if removed >= nlink)
+
+
+def cmd_prune(cfg: Config, args) -> int:
+    if not args.repos and not args.stale:
+        print("nothing to prune: name one or more models, or pass --stale", file=sys.stderr)
+        return 2
+    all_repos = cfg.scan()
+    active = downloads.active_download_dirs()
+    targets, problems = [], []
+    for name in args.repos:
+        repo = find_repo(all_repos, name)
+        if repo is None:
+            problems.append(f"  {name}: not found in any store")
+            continue
+        why = _prune_refusal(cfg, repo, active)
+        if why:
+            problems.append(f"  {repo.repo_id}: {why}")
+        elif repo not in targets:
+            targets.append(repo)
+    if problems:
+        print("refusing to prune:", file=sys.stderr)
+        print("\n".join(problems), file=sys.stderr)
+        return 1
+
+    # The plan: the models, then exactly what sync will take away once they are
+    # gone, computed by syncing the store without them.
+    remaining = [r for r in all_repos if r not in targets]
+    unlinks = []
+    if targets:
+        unlinks = [a for a in _sync_actions(cfg, remaining, dry_run=True) if a.op == "unlink"]
+    stale_count, stale_size = _prune_stale(cfg, dry_run=True) if args.stale else (0, 0)
+    # Mirror directories sync will delete count toward what gets freed; plain
+    # link removals do not free anything.
+    mirrors = [Path(a.target) for a in unlinks
+               if Path(a.target).is_dir() and not Path(a.target).is_symlink()]
+    freed = _reclaimable([r.root for r in targets] + mirrors) + stale_size
+    if not targets and not stale_count:
+        print("nothing to prune: no stale temp files found.")
+        return 0
+
+    if targets:
+        print(f"Delete from the store ({human_size(sum(r.size for r in targets))}):")
+        for r in targets:
+            kind = "symlink, target kept" if r.root.is_symlink() else human_size(r.size)
+            print(f"  {r.repo_id}  [{r.fmt}]  {kind}")
+            print(f"      {r.root}")
+        if unlinks:
+            print("\nThen sync removes these projections:")
+            for a in unlinks:
+                # The preview runs while the model still exists, so the action's
+                # own reason ("no longer projected") would read oddly here.
+                print(f"  - [{a.adapter}] {a.target}")
+    if stale_count:
+        print(f"{chr(10) if targets else ''}Stale temp files from retried downloads: "
+              f"{stale_count} ({human_size(stale_size)})")
+    print(f"\nFrees {human_size(freed)}.")
+    if args.dry_run:
+        print("DRY RUN - nothing deleted.")
+        return 0
+
+    if not args.yes:
+        if not picker.usable():
+            print("\nNo terminal to confirm on. Re-run with --yes to delete, "
+                  "or -n to preview.", file=sys.stderr)
+            return 2
+        if not _confirm("\nDelete permanently?"):
+            print("cancelled; nothing deleted.", file=sys.stderr)
+            return 1
+
+    for r in targets:
+        _delete_model(r.root, cfg.store)
+        print(f"deleted {r.repo_id}")
+    if stale_count:
+        count, size = _prune_stale(cfg, dry_run=False)
+        print(f"deleted {count} stale temp file(s), {human_size(size)}")
+    if targets:
+        # Show only what sync changed; the unchanged rest is noise here.
+        changed = [a for a in _sync_actions(cfg, cfg.scan(), dry_run=False)
+                   if a.op in ("link", "relink", "unlink", "copy", "error")]
+        print(f"\nsync: {len(changed)} change(s)")
+        for a in changed:
+            print(a)
+        if any(a.adapter == "omlx" for a in changed):
+            print("  (oMLX discovers models at startup: `omlx restart`)")
+    print(f"\nFreed {human_size(freed)}.")
     return 0
 
 
@@ -529,6 +709,32 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-prune", action="store_true",
                     help="only add and repair; leave projections of deleted models in place")
     sp.set_defaults(func=cmd_sync)
+
+    sp = sub.add_parser(
+        "prune", help="delete models from the store, then sync", formatter_class=_fmt,
+        description="Permanently delete models from the primary store, then run sync so\n"
+                    "every tool stops showing them. It lists exactly what will go (each\n"
+                    "model, its size, and every projection sync will remove) and asks\n"
+                    "before deleting anything. With no terminal it needs --yes.\n\n"
+                    "Refused: models in the HF cache (use `hf cache rm`), in an extra\n"
+                    "store (read-only), or being downloaded right now. A store entry\n"
+                    "that is a symlink is removed as a link; its target is kept.\n\n"
+                    "--stale deletes temp files that retried downloads abandoned beside\n"
+                    "a complete model; only files matched to a finished download go.",
+        epilog="examples:\n"
+               "  modelctl prune unsloth/Qwen3.8-27B-GGUF -n    # preview, delete nothing\n"
+               "  modelctl prune unsloth/Qwen3.8-27B-GGUF       # asks, then deletes + syncs\n"
+               "  modelctl prune <repo> <repo> --yes            # several, no prompt\n"
+               "  modelctl prune --stale                        # clear retry leftovers\n")
+    sp.add_argument("repos", nargs="*", metavar="REPO",
+                    help="models to delete (publisher/model, or a unique model name)")
+    sp.add_argument("--stale", action="store_true",
+                    help="also delete temp files abandoned by retried downloads")
+    sp.add_argument("-n", "--dry-run", action="store_true",
+                    help="show what would be deleted and unlinked, change nothing")
+    sp.add_argument("-y", "--yes", action="store_true",
+                    help="do not ask for confirmation")
+    sp.set_defaults(func=cmd_prune)
 
     sp = sub.add_parser(
         "adopt", help="normalize a model into <publisher>/<model> layout",

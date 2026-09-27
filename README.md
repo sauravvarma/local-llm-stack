@@ -129,6 +129,9 @@ bin/modelctl download <repo> -n         # list the repo's variants, fetch nothin
 bin/modelctl download <repo> --include '*Q4_K_M*'
 bin/modelctl sync                       # project the store into every tool
 bin/modelctl sync -n                    # dry run
+bin/modelctl prune <repo> -n            # preview deleting a model and its projections
+bin/modelctl prune <repo>               # asks, deletes from the store, then syncs
+bin/modelctl prune --stale              # clear temp files abandoned by retries
 bin/modelctl adopt <model> --publisher <name>   # MOVES into <pub>/<model> layout
 bin/modelctl ollama-import <repo>       # opt-in, COPIES bytes
 
@@ -164,6 +167,38 @@ It only removes what it can prove it made, in folders other apps own:
 It never deletes a real file it did not record, and never prunes inside a
 store: when an app's models folder *is* the store (LM Studio pointed at it),
 its links belong to you. `sync --no-prune` only adds and repairs.
+
+### Removing a model
+
+`prune` is the one command that deliberately shrinks the store. It deletes the
+model, then runs sync so every tool stops showing it:
+
+```
+$ modelctl prune incoai/Qwen3.8-27B-Splash
+Delete from the store (16.2G):
+  incoai/Qwen3.8-27B-Splash  [splash]  16.2G
+
+Then sync removes these projections:
+  - [bionic] ~/.lmstudio/models/incoai/Qwen3.8-27B-Splash
+
+Frees 16.2G.
+
+Delete permanently? [y/N]
+```
+
+The preview is computed by syncing the store *without* those models, so the
+projections it lists are exactly the ones the real run removes. "Frees" counts
+inodes, not free space before and after: a file's bytes come back only when
+its last hard link goes, which is why that Splash model frees its full size
+(the store copy and the Bionic mirror are removed together) and would free
+nothing if the mirror stayed.
+
+It asks before deleting (`-y` skips that; with no terminal it needs `-y`),
+refuses a whole batch if any name is wrong, and will not delete a model that
+is still downloading, one in an extra store (read-only), or one in the HF cache
+(use `hf cache rm`, which understands the cache's shared blobs). A store entry
+that is itself a symlink (`adopt --link`) is removed as a link; its target is
+kept.
 
 ### Picking a quant
 
